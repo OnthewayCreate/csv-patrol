@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { Upload, FileText, CheckCircle, Play, Download, Loader2, ShieldAlert, Pause, Trash2, Eye, Zap, FolderOpen, Lock, LogOut, History, Settings, Save, AlertTriangle, RefreshCw, Layers, Siren, Scale, SearchCheck, Activity, Cpu, Key, Ban } from 'lucide-react';
+import { Upload, FileText, CheckCircle, Play, Download, Loader2, ShieldAlert, Pause, Trash2, Eye, Zap, FolderOpen, Lock, LogOut, History, Settings, Save, AlertTriangle, RefreshCw, Layers, Siren, Scale, SearchCheck, Activity, Cpu, Key, Ban, RotateCcw } from 'lucide-react';
 import { initializeApp } from 'firebase/app';
 import { getFirestore, collection, addDoc, query, orderBy, limit, onSnapshot, serverTimestamp } from 'firebase/firestore';
 
@@ -19,10 +19,10 @@ const RISK_MAP = {
 
 // 利用可能なモデル一覧
 const MODELS = [
-  { id: 'gemini-1.5-flash', name: 'Gemini 1.5 Flash (推奨・高速)' },
-  { id: 'gemini-1.5-flash-8b', name: 'Gemini 1.5 Flash-8B (超高速・軽量)' },
-  { id: 'gemini-1.5-pro', name: 'Gemini 1.5 Pro (高精度・低速)' },
-  { id: 'gemini-2.0-flash-exp', name: 'Gemini 2.0 Flash Exp (実験的・最新)' },
+  { id: 'gemini-1.5-flash', name: 'Gemini 1.5 Flash (推奨・安定)' },
+  { id: 'gemini-1.5-flash-8b', name: 'Gemini 1.5 Flash-8B (超高速)' },
+  { id: 'gemini-1.5-pro', name: 'Gemini 1.5 Pro (高精度)' },
+  { id: 'gemini-2.0-flash-exp', name: 'Gemini 2.0 Flash Exp (実験的)' },
 ];
 
 // ==========================================
@@ -74,31 +74,23 @@ const cleanJson = (text) => {
   } catch (e) { return text; }
 };
 
-// --- キー管理マネージャー ---
-// 状態を持たせるためクラスではなく外部変数的な管理、あるいはStateで管理
-// ここでは簡易的に関数内で処理するが、Appコンポーネントで管理する
-
-// キーをパースして配列にする
 const parseKeys = (text) => {
   if (!text) return [];
   return text.split(/[\n, ]+/)
     .map(k => k.trim())
-    .filter(k => k.length > 10 && k.startsWith('AIza')); // 簡易バリデーション
+    .filter(k => k.length > 10 && k.startsWith('AIza')); 
 };
 
 // ==========================================
-// 2. API呼び出し関数 (キーローテーション & 自動排除機能付き)
+// 2. API呼び出し関数 (オートヒーリング機能付き)
 // ==========================================
 
-async function checkIPRiskBulkWithRotation(products, availableKeys, setAvailableKeys, modelId) {
-  // キーがなければエラー
+async function checkIPRiskBulkWithRotation(products, availableKeys, setAvailableKeys, modelId, isFallback = false) {
   if (availableKeys.length === 0) {
     throw new Error("ALL_KEYS_DEAD: 有効なAPIキーがありません");
   }
 
-  // ランダムにキーを選択
   const apiKey = availableKeys[Math.floor(Math.random() * availableKeys.length)];
-
   const productsListText = products.map(p => `ID:${p.id} 商品名:${p.name}`).join('\n');
   const systemInstruction = `
 あなたはECモールの「知的財産権・薬機法・安全管理」の【鬼検閲官】です。
@@ -116,9 +108,9 @@ JSON配列のみ:
 [{"id": ID, "risk_level": "Critical/High/Medium/Low", "reason": "短い理由"}, ...]
 `;
 
-  // モデルIDの安全策
-  const safeModelId = modelId || 'gemini-1.5-flash';
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${safeModelId}:generateContent?key=${apiKey}`;
+  // フォールバック時は強制的に安定版(1.5-flash)を使う
+  const currentModelId = isFallback ? 'gemini-1.5-flash' : (modelId || 'gemini-1.5-flash');
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${currentModelId}:generateContent?key=${apiKey}`;
   
   const payload = {
     contents: [{ parts: [{ text: `以下の商品を一括判定せよ:\n${productsListText}` }] }],
@@ -133,25 +125,28 @@ JSON配列のみ:
       body: JSON.stringify(payload)
     });
     
-    // 404 (Not Found) or 400 (Bad Request) or 403 (Forbidden) -> このキーは死んでいる
-    if (response.status === 404 || response.status === 400 || response.status === 403) {
-      console.warn(`不良キーを検知しました。除外してリトライします: ${apiKey.slice(0, 5)}... (${response.status})`);
-      
-      // 不良キーを除外した新しいリストを作成
-      const newKeys = availableKeys.filter(k => k !== apiKey);
-      // 親の状態を更新 (非同期なのでここでの反映は次回以降だが、再帰呼び出しにはnewKeysを渡す)
-      if (setAvailableKeys) setAvailableKeys(newKeys);
-      
-      // 残りのキーで即時リトライ
-      return checkIPRiskBulkWithRotation(products, newKeys, setAvailableKeys, modelId);
+    // 404 (Not Found): モデルが存在しない -> モデルを変更してリトライ (キーは捨てない)
+    if (response.status === 404) {
+      if (!isFallback && currentModelId !== 'gemini-1.5-flash') {
+        console.warn(`モデル(${currentModelId})が404エラー。安定版(1.5-flash)で自動リトライします。`);
+        return checkIPRiskBulkWithRotation(products, availableKeys, setAvailableKeys, 'gemini-1.5-flash', true);
+      }
+      // すでに安定版でも404ならキーが無効な可能性が高いのでキーを除外
     }
 
-    // 429 (Too Many Requests) -> キーは生きているが忙しい。待機してリトライ (キーは変えない or 変える)
+    // 400 (Bad Request) or 403 (Forbidden) or 404(Fallback済み) -> キー無効
+    if (response.status === 404 || response.status === 400 || response.status === 403) {
+      console.warn(`不良キー検知(${response.status})。除外してリトライ: ${apiKey.slice(0, 5)}...`);
+      const newKeys = availableKeys.filter(k => k !== apiKey);
+      if (setAvailableKeys) setAvailableKeys(newKeys);
+      return checkIPRiskBulkWithRotation(products, newKeys, setAvailableKeys, currentModelId, isFallback);
+    }
+
+    // 429 (Too Many Requests) -> 待機してリトライ
     if (response.status === 429) {
       const waitTime = 2000 + Math.random() * 3000;
       await new Promise(resolve => setTimeout(resolve, waitTime));
-      // 別のキーで試すために再帰 (キーはランダム再選択される)
-      return checkIPRiskBulkWithRotation(products, availableKeys, setAvailableKeys, modelId);
+      return checkIPRiskBulkWithRotation(products, availableKeys, setAvailableKeys, currentModelId, isFallback);
     }
     
     if (!response.ok) throw new Error(`API Error: ${response.status}`);
@@ -177,19 +172,10 @@ JSON配列のみ:
     return resultMap;
 
   } catch (error) {
-    // 全キー全滅の場合
-    if (error.message.includes("ALL_KEYS_DEAD")) {
-      throw error;
-    }
+    if (error.message.includes("ALL_KEYS_DEAD")) throw error;
     
-    // JSONパースエラー等は、AIの一時的な不調なので、別のキーでリトライしてみる
     console.error("Bulk Check Error:", error);
-    // 致命的でないなら少し待ってリトライ
     await new Promise(resolve => setTimeout(resolve, 2000));
-    // 別のキーでリトライ（availableKeysはそのまま）
-    // 無限ループ防止のため、簡易的なエラーマップを返してスキップする手もあるが、
-    // ここでは粘り強くリトライする
-    // ただし再帰が深くなりすぎないようにしたいが、現状はキーローテーションで分散されることを期待
     const errorMap = {};
     products.forEach(p => {
       errorMap[p.id] = { risk: "Error", reason: error.message };
@@ -198,13 +184,12 @@ JSON配列のみ:
   }
 }
 
-// 詳細分析用（同様にローテーション）
-async function checkIPRiskDetailWithRotation(product, availableKeys, setAvailableKeys, modelId) {
+async function checkIPRiskDetailWithRotation(product, availableKeys, setAvailableKeys, modelId, isFallback = false) {
   if (availableKeys.length === 0) return { risk: product.risk, detail: "APIキー切れ" };
   
   const apiKey = availableKeys[Math.floor(Math.random() * availableKeys.length)];
-  const safeModelId = modelId || 'gemini-1.5-flash';
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${safeModelId}:generateContent?key=${apiKey}`;
+  const currentModelId = isFallback ? 'gemini-1.5-flash' : (modelId || 'gemini-1.5-flash');
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${currentModelId}:generateContent?key=${apiKey}`;
   
   const systemInstruction = `あなたは知的財産権弁護士です。以下の商品のリスクを再鑑定し、JSONで出力してください。`;
   const payload = {
@@ -220,16 +205,21 @@ async function checkIPRiskDetailWithRotation(product, availableKeys, setAvailabl
       body: JSON.stringify(payload)
     });
     
+    if (response.status === 404) {
+       if (!isFallback && currentModelId !== 'gemini-1.5-flash') {
+         return checkIPRiskDetailWithRotation(product, availableKeys, setAvailableKeys, 'gemini-1.5-flash', true);
+       }
+    }
+
     if (response.status === 404 || response.status === 400 || response.status === 403) {
-      // 不良キー除外
       const newKeys = availableKeys.filter(k => k !== apiKey);
       if (setAvailableKeys) setAvailableKeys(newKeys);
-      return checkIPRiskDetailWithRotation(product, newKeys, setAvailableKeys, modelId);
+      return checkIPRiskDetailWithRotation(product, newKeys, setAvailableKeys, currentModelId, isFallback);
     }
 
     if (response.status === 429) {
       await new Promise(resolve => setTimeout(resolve, 2000));
-      return checkIPRiskDetailWithRotation(product, availableKeys, setAvailableKeys, modelId);
+      return checkIPRiskDetailWithRotation(product, availableKeys, setAvailableKeys, currentModelId, isFallback);
     }
     
     if (!response.ok) throw new Error(`API Error: ${response.status}`);
@@ -259,7 +249,7 @@ export default function App() {
   const [inputPassword, setInputPassword] = useState('');
   
   const [apiKeysText, setApiKeysText] = useState('');
-  const [activeKeys, setActiveKeys] = useState([]); // 実行中に使用する有効なキーリスト
+  const [activeKeys, setActiveKeys] = useState([]); 
   
   const [firebaseConfigJson, setFirebaseConfigJson] = useState('');
   const [modelId, setModelId] = useState('gemini-1.5-flash'); 
@@ -283,7 +273,7 @@ export default function App() {
     errorCount: 0,
     currentBatch: 0,
     totalBatches: 0,
-    deadKeysCount: 0 // 死んだキーの数
+    deadKeysCount: 0 
   });
 
   const [encoding, setEncoding] = useState('Shift_JIS');
@@ -311,7 +301,6 @@ export default function App() {
     }
   }, []);
 
-  // APIキーテキストが変更されたらActiveKeysも更新
   useEffect(() => {
     setActiveKeys(parseKeys(apiKeysText));
   }, [apiKeysText]);
@@ -398,6 +387,28 @@ export default function App() {
     setCsvData(prev => [...prev, ...newRows]);
   };
 
+  // 全リセットして次のファイルへ
+  const handleReset = () => {
+    if (isProcessing && !confirm("処理を中断して初期化しますか？")) return;
+    setFiles([]);
+    setCsvData([]);
+    setResults([]);
+    setProgress(0);
+    setStatusState({ 
+      message: '待機中', 
+      successCount: 0, 
+      errorCount: 0, 
+      currentBatch: 0, 
+      totalBatches: 0, 
+      deadKeysCount: 0 
+    });
+    setIsProcessing(false);
+    setIsDetailAnalyzing(false);
+    stopRef.current = true;
+    setHeaders([]);
+    setTargetColIndex(-1);
+  };
+
   // --- 一次審査（バルク） ---
   const startProcessing = async () => {
     if (activeKeys.length === 0) return alert("有効なAPIキーが設定されていません。設定画面を確認してください。");
@@ -408,10 +419,6 @@ export default function App() {
     stopRef.current = false;
     setResults([]); 
     setProgress(0);
-    
-    // 実行用の一時的なキーリスト（ここで減っても設定画面のテキストは消えない）
-    // StateのactiveKeysではなく、実行時のローカルコピーを使うと、再実行時に復活できるが、
-    // ここでは「セッション中はずっと除外」するためにStateのセッターを渡す
     
     setStatusState({ 
       message: '初期化中...', 
@@ -435,7 +442,7 @@ export default function App() {
     while (currentIndex < total) {
       if (stopRef.current) break;
       if (activeKeys.length === 0) {
-        alert("全てのAPIキーがエラー（404/400等）で無効化されました。キーを確認してください。");
+        alert("全てのAPIキーがエラーで無効化されました。");
         break;
       }
 
@@ -447,7 +454,7 @@ export default function App() {
         message: `並列処理中... (${currentIndex}/${total}件)`,
         currentBatch: currentBatchNum,
         totalBatches: totalBatches,
-        deadKeysCount: parseKeys(apiKeysText).length - activeKeys.length // 元の数 - 現在の数
+        deadKeysCount: parseKeys(apiKeysText).length - activeKeys.length 
       }));
 
       for (let c = 0; c < CONCURRENCY; c++) {
@@ -467,6 +474,7 @@ export default function App() {
         }
         
         if (chunkProducts.length > 0) {
+          // モデルIDを渡す
           tasks.push(
             checkIPRiskBulkWithRotation(chunkProducts, activeKeys, setActiveKeys, modelId).then(resultMap => {
               return chunkProducts.map(p => ({
@@ -564,7 +572,6 @@ export default function App() {
         setResults([...newResults]); 
         
       } catch (e) {
-         // 個別のエラーは無視して進む
       }
       await new Promise(resolve => setTimeout(resolve, 500));
     }
@@ -646,7 +653,6 @@ export default function App() {
         {activeTab === 'checker' && (
           <div className="space-y-6 animate-in fade-in duration-300">
             <div className="bg-white p-6 rounded-xl shadow-sm border border-slate-200 space-y-4">
-              {/* ステータスコックピット */}
               <div className="grid grid-cols-1 md:grid-cols-4 gap-4 mb-4">
                 <div className={`p-4 rounded-lg border flex items-center gap-3 bg-slate-50 border-slate-200`}>
                   <Activity className="w-5 h-5 text-blue-600" />
@@ -678,7 +684,6 @@ export default function App() {
                 </div>
               </div>
 
-              {/* ファイルアップロード */}
               <div className="flex flex-col lg:flex-row gap-6">
                 <div className="flex-1">
                   <div className="border-2 border-dashed border-slate-300 rounded-xl p-8 text-center hover:bg-blue-50 transition-colors relative cursor-pointer min-h-[160px] flex flex-col items-center justify-center group">
@@ -690,7 +695,7 @@ export default function App() {
                   {files.length > 0 && (
                     <div className="mt-4 bg-slate-50 rounded-lg p-3 border border-slate-100 flex justify-between items-center">
                       <span className="text-xs font-bold text-slate-600">読み込み済み: {files.length}ファイル ({csvData.length}件)</span>
-                      <button onClick={() => {setFiles([]); setCsvData([]); setResults([]);}} className="text-xs text-red-500 hover:text-red-700 flex items-center gap-1"><Trash2 className="w-3 h-3" /> 全削除</button>
+                      <button onClick={handleReset} className="text-xs text-red-500 hover:text-red-700 flex items-center gap-1"><Trash2 className="w-3 h-3" /> 全削除</button>
                     </div>
                   )}
                 </div>
@@ -732,7 +737,13 @@ export default function App() {
                   </div>
                   
                   {!isProcessing && !isDetailAnalyzing ? (
-                    <button onClick={startProcessing} disabled={files.length === 0} className="flex items-center gap-2 px-8 py-3 bg-blue-600 hover:bg-blue-700 disabled:bg-slate-300 text-white font-bold rounded-lg shadow-md transition-transform active:scale-95"><Play className="w-5 h-5" /> 一次審査開始</button>
+                    <div className="flex items-center gap-2">
+                      {results.length > 0 ? (
+                        <button onClick={handleReset} className="flex items-center gap-2 px-8 py-3 bg-slate-600 hover:bg-slate-700 text-white font-bold rounded-lg shadow-md transition-transform active:scale-95"><RotateCcw className="w-5 h-5" /> 新規チェックを開始</button>
+                      ) : (
+                        <button onClick={startProcessing} disabled={files.length === 0} className="flex items-center gap-2 px-8 py-3 bg-blue-600 hover:bg-blue-700 disabled:bg-slate-300 text-white font-bold rounded-lg shadow-md transition-transform active:scale-95"><Play className="w-5 h-5" /> 一次審査開始</button>
+                      )}
+                    </div>
                   ) : (
                     <button onClick={() => {stopRef.current = true; setIsProcessing(false); setIsDetailAnalyzing(false); setStatusState(p => ({...p, message: '停止しました'}));}} className="flex items-center gap-2 px-8 py-3 bg-amber-500 hover:bg-amber-600 text-white font-bold rounded-lg shadow-md transition-transform active:scale-95"><Pause className="w-5 h-5" /> 一時停止</button>
                   )}
@@ -792,7 +803,48 @@ export default function App() {
           </div>
         )}
 
-        {/* --- 設定画面 --- */}
+        {/* ... (history, settings tabs are the same) ... */}
+        {activeTab === 'history' && (
+          <div className="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden animate-in fade-in">
+            <div className="p-6 border-b border-slate-100 flex justify-between items-center bg-slate-50">
+              <div>
+                <h2 className="text-lg font-bold text-slate-800 flex items-center gap-2"><History className="w-5 h-5 text-blue-600" /> チェック履歴 (最新50件)</h2>
+                <p className="text-xs text-slate-500 mt-1">「危険」「高」「中」の判定のみクラウドに保存されています。</p>
+              </div>
+              {!db && <span className="text-xs text-red-500 bg-red-50 px-2 py-1 rounded border border-red-100">※Firebase未設定</span>}
+            </div>
+            <div className="overflow-x-auto">
+              <table className="w-full text-sm text-left">
+                <thead className="text-xs text-slate-500 uppercase bg-slate-50">
+                  <tr>
+                    <th className="px-6 py-3">日時</th>
+                    <th className="px-6 py-3 text-center">判定</th>
+                    <th className="px-6 py-3">商品名</th>
+                    <th className="px-6 py-3">理由 (詳細分析含む)</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-100">
+                  {historyData.map((item) => (
+                    <tr key={item.id} className="hover:bg-slate-50">
+                      <td className="px-6 py-4 whitespace-nowrap text-slate-400 text-xs">
+                        {item.createdAt ? new Date(item.createdAt.seconds * 1000).toLocaleString() : '-'}
+                      </td>
+                      <td className="px-6 py-4 text-center"><RiskBadge risk={item.risk} /></td>
+                      <td className="px-6 py-4 font-medium text-slate-700 max-w-xs truncate">{item.productName}</td>
+                      <td className="px-6 py-4 text-slate-600 text-xs">{item.reason}</td>
+                    </tr>
+                  ))}
+                  {historyData.length === 0 && (
+                    <tr>
+                      <td colSpan="4" className="px-6 py-8 text-center text-slate-400">履歴がありません</td>
+                    </tr>
+                  )}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        )}
+
         {activeTab === 'settings' && (
           <div className="max-w-2xl mx-auto space-y-6 animate-in fade-in">
             <div className="bg-white p-6 rounded-xl shadow-sm border border-slate-200">
