@@ -16,12 +16,16 @@ const RISK_MAP = {
   'Error': { label: 'エラー', color: 'bg-gray-200 text-gray-800 border-gray-300' }
 };
 
+// 【重要】ユーザー環境に合わせてモデル定義を最新化
 const MODELS = [
-  { id: 'gemini-1.5-flash', name: 'Gemini 1.5 Flash (推奨・安定)' },
-  { id: 'gemini-1.5-flash-8b', name: 'Gemini 1.5 Flash-8B (超高速)' },
-  { id: 'gemini-1.5-pro', name: 'Gemini 1.5 Pro (高精度)' },
+  { id: 'gemini-2.5-flash', name: 'Gemini 2.5 Flash (推奨・最新高速)' },
   { id: 'gemini-2.0-flash-exp', name: 'Gemini 2.0 Flash Exp (実験的)' },
+  { id: 'gemini-3-pro', name: 'Gemini 3.0 Pro (最高精度)' },
+  { id: 'gemini-2.5-pro', name: 'Gemini 2.5 Pro (高精度)' },
 ];
+
+// デフォルトモデルも最新の 2.5 Flash に変更
+const DEFAULT_MODEL = 'gemini-2.5-flash';
 
 // ==========================================
 // 1. ユーティリティ
@@ -106,7 +110,8 @@ JSON配列のみ:
 [{"id": ID, "risk_level": "Critical/High/Medium/Low", "reason": "短い理由"}, ...]
 `;
 
-  const currentModelId = isFallback ? 'gemini-1.5-flash' : (modelId || 'gemini-1.5-flash');
+  // フォールバック時も最新の安定版(2.5-flash)を使用
+  const currentModelId = isFallback ? DEFAULT_MODEL : (modelId || DEFAULT_MODEL);
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${currentModelId}:generateContent?key=${apiKey}`;
   
   const payload = {
@@ -122,10 +127,11 @@ JSON配列のみ:
       body: JSON.stringify(payload)
     });
     
+    // 404: モデルエラー -> デフォルトモデルでリトライ
     if (response.status === 404) {
-      if (!isFallback && currentModelId !== 'gemini-1.5-flash') {
-        console.warn(`モデル(${currentModelId})404エラー。安定版(1.5-flash)でリトライします。`);
-        return checkIPRiskBulkWithRotation(products, availableKeys, setAvailableKeys, 'gemini-1.5-flash', true);
+      if (!isFallback && currentModelId !== DEFAULT_MODEL) {
+        console.warn(`モデル(${currentModelId})404エラー。標準(${DEFAULT_MODEL})でリトライします。`);
+        return checkIPRiskBulkWithRotation(products, availableKeys, setAvailableKeys, DEFAULT_MODEL, true);
       }
     }
 
@@ -179,7 +185,7 @@ async function checkIPRiskDetailWithRotation(product, availableKeys, setAvailabl
   if (availableKeys.length === 0) return { risk: product.risk, detail: "APIキー切れ" };
   
   const apiKey = availableKeys[Math.floor(Math.random() * availableKeys.length)];
-  const currentModelId = isFallback ? 'gemini-1.5-flash' : (modelId || 'gemini-1.5-flash');
+  const currentModelId = isFallback ? DEFAULT_MODEL : (modelId || DEFAULT_MODEL);
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${currentModelId}:generateContent?key=${apiKey}`;
   
   const systemInstruction = `あなたは知的財産権弁護士です。以下の商品のリスクを再鑑定し、JSONで出力してください。`;
@@ -197,8 +203,8 @@ async function checkIPRiskDetailWithRotation(product, availableKeys, setAvailabl
     });
     
     if (response.status === 404) {
-       if (!isFallback && currentModelId !== 'gemini-1.5-flash') {
-         return checkIPRiskDetailWithRotation(product, availableKeys, setAvailableKeys, 'gemini-1.5-flash', true);
+       if (!isFallback && currentModelId !== DEFAULT_MODEL) {
+         return checkIPRiskDetailWithRotation(product, availableKeys, setAvailableKeys, DEFAULT_MODEL, true);
        }
     }
 
@@ -240,10 +246,10 @@ export default function App() {
   
   const [apiKeysText, setApiKeysText] = useState('');
   const [activeKeys, setActiveKeys] = useState([]); 
-  const [keyStatuses, setKeyStatuses] = useState({}); // キーごとの接続テスト結果
+  const [keyStatuses, setKeyStatuses] = useState({}); 
   
   const [firebaseConfigJson, setFirebaseConfigJson] = useState('');
-  const [modelId, setModelId] = useState('gemini-1.5-flash'); 
+  const [modelId, setModelId] = useState(DEFAULT_MODEL); // デフォルトを2.5-flashに
   const [db, setDb] = useState(null);
   
   const [activeTab, setActiveTab] = useState('checker');
@@ -285,7 +291,12 @@ export default function App() {
       setActiveKeys(parseKeys(legacyKey));
     }
 
-    if (savedModel) setModelId(savedModel);
+    if (savedModel) {
+      setModelId(savedModel);
+    } else {
+      setModelId(DEFAULT_MODEL); // 保存がない場合は2.5-flash
+    }
+
     if (savedFbConfig) {
       setFirebaseConfigJson(savedFbConfig);
       initFirebase(savedFbConfig);
@@ -329,7 +340,7 @@ export default function App() {
     alert("設定を保存しました");
   };
 
-  // 接続テスト
+  // 接続テスト (修正版: 選択中のモデルを使用)
   const testConnection = async () => {
     const keys = parseKeys(apiKeysText);
     if (keys.length === 0) return alert("APIキーが入力されていません");
@@ -337,12 +348,14 @@ export default function App() {
     setKeyStatuses({});
     let results = {};
     
+    const testModelId = modelId || DEFAULT_MODEL;
+
     for (const key of keys) {
       results[key] = { status: 'loading' };
       setKeyStatuses({...results});
       
       try {
-        const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${key}`;
+        const url = `https://generativelanguage.googleapis.com/v1beta/models/${testModelId}:generateContent?key=${key}`;
         const res = await fetch(url, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -352,7 +365,10 @@ export default function App() {
         if (res.ok) {
           results[key] = { status: 'ok', msg: '接続OK' };
         } else {
-          results[key] = { status: 'error', msg: `エラー: ${res.status}` };
+          // エラー内容を詳しく表示
+          let errorMsg = `エラー: ${res.status}`;
+          if (res.status === 404) errorMsg += " (モデル無し)";
+          results[key] = { status: 'error', msg: errorMsg };
         }
       } catch (e) {
         results[key] = { status: 'error', msg: '通信エラー' };
@@ -410,7 +426,6 @@ export default function App() {
     setCsvData(prev => [...prev, ...newRows]);
   };
 
-  // 全リセットして次のファイルへ
   const handleReset = () => {
     if (isProcessing && !confirm("処理を中断して初期化しますか？")) return;
     setFiles([]);
@@ -432,9 +447,7 @@ export default function App() {
     setTargetColIndex(-1);
   };
 
-  // --- 一次審査（バルク） ---
   const startProcessing = async () => {
-    // 開始時に全キーを再ロード（復活させる）
     const initialKeys = parseKeys(apiKeysText);
     setActiveKeys(initialKeys);
 
@@ -468,14 +481,7 @@ export default function App() {
 
     while (currentIndex < total) {
       if (stopRef.current) break;
-      // activeKeysは関数内で更新される可能性があるため、ループ内ではstateのactiveKeysを参照したいが
-      // 実際には非同期更新なので、ここではローカル変数は使わず、再レンダリングを待つ形になる
-      // 本当はRefで管理するのがベストだが、今回は簡易的にState更新を信じる
       
-      // もしStateが更新されて空になっていたら停止
-      // ただし、非同期ループ内でのState参照は古くなることがあるため、
-      // checkIPRiskBulkWithRotation内でキー切れエラーが出たらここでキャッチして止める
-
       const tasks = [];
       const currentBatchNum = Math.floor(currentIndex / BULK_SIZE) + 1;
       
@@ -484,7 +490,7 @@ export default function App() {
         message: `並列処理中... (${currentIndex}/${total}件)`,
         currentBatch: currentBatchNum,
         totalBatches: totalBatches,
-        deadKeysCount: parseKeys(apiKeysText).length - activeKeys.length // 目安
+        deadKeysCount: parseKeys(apiKeysText).length - activeKeys.length 
       }));
 
       for (let c = 0; c < CONCURRENCY; c++) {
@@ -504,7 +510,6 @@ export default function App() {
         }
         
         if (chunkProducts.length > 0) {
-          // モデルIDを渡す
           tasks.push(
             checkIPRiskBulkWithRotation(chunkProducts, activeKeys, setActiveKeys, modelId).then(resultMap => {
               return chunkProducts.map(p => ({
@@ -852,11 +857,11 @@ export default function App() {
                     value={apiKeysText} 
                     onChange={(e) => setApiKeysText(e.target.value)} 
                     className="w-full px-4 py-2 border rounded-lg bg-slate-50 h-32 font-mono text-sm" 
-                    placeholder={`AIza...\nAIza...\nAIza...\n(キーを改行区切りで複数入力すると、負荷分散モードが作動します)`}
+                    placeholder={`AIza...\nAIza...\nAIza...\n(キーを改行区切りで複数入力すると、エラーが出たキーを自動で排除して処理を継続します。)`}
                   />
                   <div className="flex justify-between items-start mt-2">
-                    <p className="text-xs text-slate-500">複数のAPIキーを入力すると、エラーが出たキーを自動で排除して処理を継続します。</p>
-                    <button onClick={testConnection} className="flex items-center gap-1 px-3 py-1 bg-green-50 text-green-700 border border-green-200 rounded text-xs font-bold hover:bg-green-100 transition-colors"><Stethoscope className="w-3 h-3" /> APIキー接続テスト</button>
+                    <p className="text-xs text-slate-500">複数入力すると、エラーが出たキーを自動で排除して処理を継続します。<br/><span className="text-green-600 font-bold">APIキー接続テストボタンでキーの有効性を確認してください。</span></p>
+                    <button onClick={testConnection} className="flex items-center gap-1 px-3 py-1 bg-green-50 text-green-700 border border-green-200 rounded text-xs font-bold hover:bg-green-100 transition-colors whitespace-nowrap"><Stethoscope className="w-3 h-3" /> APIキー接続テスト</button>
                   </div>
                   
                   {/* キーのステータス表示 */}
