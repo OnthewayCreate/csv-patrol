@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { Upload, FileText, CheckCircle, Play, Download, Loader2, ShieldAlert, Pause, Trash2, Eye, Zap, FolderOpen, Lock, LogOut, History, Settings, Save, AlertTriangle, RefreshCw, Layers, Siren, Scale, SearchCheck, Activity, Cpu, Key, Ban, RotateCcw, Stethoscope, Check, X } from 'lucide-react';
+import { Upload, FileText, CheckCircle, Play, Download, Loader2, ShieldAlert, Pause, Trash2, Eye, Zap, FolderOpen, Lock, LogOut, History, Settings, Save, AlertTriangle, RefreshCw, Layers, Siren, Scale, SearchCheck, Activity, Cpu, Key, Ban, RotateCcw, Stethoscope, Check, X, Edit3 } from 'lucide-react';
 import { initializeApp } from 'firebase/app';
 import { getFirestore, collection, addDoc, query, orderBy, limit, onSnapshot, serverTimestamp } from 'firebase/firestore';
 
@@ -16,16 +16,19 @@ const RISK_MAP = {
   'Error': { label: 'エラー', color: 'bg-gray-200 text-gray-800 border-gray-300' }
 };
 
-// 【重要】ユーザー環境に合わせてモデル定義を最新化
+// 実績のあるモデルID一覧 (ダッシュボードの表示名とAPI IDは異なる場合があります)
 const MODELS = [
-  { id: 'gemini-2.5-flash', name: 'Gemini 2.5 Flash (推奨・最新高速)' },
-  { id: 'gemini-2.0-flash-exp', name: 'Gemini 2.0 Flash Exp (実験的)' },
-  { id: 'gemini-3-pro', name: 'Gemini 3.0 Pro (最高精度)' },
-  { id: 'gemini-2.5-pro', name: 'Gemini 2.5 Pro (高精度)' },
+  { id: 'gemini-1.5-flash', name: 'Gemini 1.5 Flash (推奨・最も安定)' },
+  { id: 'gemini-1.5-flash-001', name: 'Gemini 1.5 Flash-001 (安定版)' },
+  { id: 'gemini-1.5-flash-002', name: 'Gemini 1.5 Flash-002 (最新安定版)' },
+  { id: 'gemini-1.5-flash-8b', name: 'Gemini 1.5 Flash-8B (軽量高速)' },
+  { id: 'gemini-1.5-pro', name: 'Gemini 1.5 Pro (高精度)' },
+  { id: 'gemini-2.0-flash-exp', name: 'Gemini 2.0 Flash Exp (実験的・高速)' },
+  { id: 'gemini-2.5-flash', name: 'Gemini 2.5 Flash (ダッシュボード表示用)' }, 
 ];
 
-// デフォルトモデルも最新の 2.5 Flash に変更
-const DEFAULT_MODEL = 'gemini-2.5-flash';
+// デフォルトは最も確実な 1.5 Flash に戻します
+const DEFAULT_MODEL = 'gemini-1.5-flash';
 
 // ==========================================
 // 1. ユーティリティ
@@ -110,7 +113,6 @@ JSON配列のみ:
 [{"id": ID, "risk_level": "Critical/High/Medium/Low", "reason": "短い理由"}, ...]
 `;
 
-  // フォールバック時も最新の安定版(2.5-flash)を使用
   const currentModelId = isFallback ? DEFAULT_MODEL : (modelId || DEFAULT_MODEL);
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${currentModelId}:generateContent?key=${apiKey}`;
   
@@ -249,7 +251,8 @@ export default function App() {
   const [keyStatuses, setKeyStatuses] = useState({}); 
   
   const [firebaseConfigJson, setFirebaseConfigJson] = useState('');
-  const [modelId, setModelId] = useState(DEFAULT_MODEL); // デフォルトを2.5-flashに
+  const [modelId, setModelId] = useState(DEFAULT_MODEL);
+  const [customModelId, setCustomModelId] = useState(''); // カスタムモデル入力用
   const [db, setDb] = useState(null);
   
   const [activeTab, setActiveTab] = useState('checker');
@@ -281,6 +284,7 @@ export default function App() {
     const savedKeys = localStorage.getItem('gemini_api_keys'); 
     const savedFbConfig = localStorage.getItem('firebase_config');
     const savedModel = localStorage.getItem('gemini_model');
+    const savedCustomModel = localStorage.getItem('gemini_custom_model');
     const legacyKey = localStorage.getItem('gemini_api_key');
     
     if (savedKeys) {
@@ -291,12 +295,9 @@ export default function App() {
       setActiveKeys(parseKeys(legacyKey));
     }
 
-    if (savedModel) {
-      setModelId(savedModel);
-    } else {
-      setModelId(DEFAULT_MODEL); // 保存がない場合は2.5-flash
-    }
-
+    if (savedModel) setModelId(savedModel);
+    if (savedCustomModel) setCustomModelId(savedCustomModel);
+    
     if (savedFbConfig) {
       setFirebaseConfigJson(savedFbConfig);
       initFirebase(savedFbConfig);
@@ -336,11 +337,12 @@ export default function App() {
     localStorage.setItem('gemini_api_keys', apiKeysText);
     localStorage.setItem('firebase_config', firebaseConfigJson);
     localStorage.setItem('gemini_model', modelId);
+    localStorage.setItem('gemini_custom_model', customModelId);
     if (firebaseConfigJson) initFirebase(firebaseConfigJson);
     alert("設定を保存しました");
   };
 
-  // 接続テスト (修正版: 選択中のモデルを使用)
+  // 接続テスト (賢くフォールバックする)
   const testConnection = async () => {
     const keys = parseKeys(apiKeysText);
     if (keys.length === 0) return alert("APIキーが入力されていません");
@@ -348,27 +350,40 @@ export default function App() {
     setKeyStatuses({});
     let results = {};
     
-    const testModelId = modelId || DEFAULT_MODEL;
+    // 現在選択中のモデル (カスタムがあればそちら優先)
+    const targetModel = modelId === 'custom' ? customModelId : modelId;
 
     for (const key of keys) {
       results[key] = { status: 'loading' };
       setKeyStatuses({...results});
       
       try {
-        const url = `https://generativelanguage.googleapis.com/v1beta/models/${testModelId}:generateContent?key=${key}`;
-        const res = await fetch(url, {
+        // まず選択中のモデルでテスト
+        const url = `https://generativelanguage.googleapis.com/v1beta/models/${targetModel}:generateContent?key=${key}`;
+        let res = await fetch(url, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ contents: [{ parts: [{ text: "Hello" }] }] })
         });
         
         if (res.ok) {
-          results[key] = { status: 'ok', msg: '接続OK' };
+          results[key] = { status: 'ok', msg: `接続OK (${targetModel})` };
+        } else if (res.status === 404) {
+          // 404なら安定版で再トライ
+          const fallbackUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${key}`;
+          const resFallback = await fetch(fallbackUrl, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ contents: [{ parts: [{ text: "Hello" }] }] })
+          });
+          
+          if (resFallback.ok) {
+             results[key] = { status: 'ok', msg: '注意: 1.5 Flashで接続 (設定モデル無効)' };
+          } else {
+             results[key] = { status: 'error', msg: 'エラー: キー無効または全滅' };
+          }
         } else {
-          // エラー内容を詳しく表示
-          let errorMsg = `エラー: ${res.status}`;
-          if (res.status === 404) errorMsg += " (モデル無し)";
-          results[key] = { status: 'error', msg: errorMsg };
+          results[key] = { status: 'error', msg: `エラー: ${res.status}` };
         }
       } catch (e) {
         results[key] = { status: 'error', msg: '通信エラー' };
@@ -479,6 +494,9 @@ export default function App() {
     const initialJitter = Math.random() * 2000;
     await new Promise(resolve => setTimeout(resolve, initialJitter));
 
+    // 実行時に使うモデルID
+    const currentModelId = modelId === 'custom' ? customModelId : modelId;
+
     while (currentIndex < total) {
       if (stopRef.current) break;
       
@@ -511,7 +529,7 @@ export default function App() {
         
         if (chunkProducts.length > 0) {
           tasks.push(
-            checkIPRiskBulkWithRotation(chunkProducts, activeKeys, setActiveKeys, modelId).then(resultMap => {
+            checkIPRiskBulkWithRotation(chunkProducts, activeKeys, setActiveKeys, currentModelId).then(resultMap => {
               return chunkProducts.map(p => ({
                 id: p.id,
                 productName: p.name,
@@ -576,6 +594,7 @@ export default function App() {
     const totalRisky = riskyItems.length;
     let newResults = [...results];
     const CONCURRENCY = 5;
+    const currentModelId = modelId === 'custom' ? customModelId : modelId;
     
     setStatusState(prev => ({ ...prev, message: '詳細鑑定を開始します...', totalBatches: totalRisky, currentBatch: 0 }));
 
@@ -588,7 +607,7 @@ export default function App() {
 
       try {
         const promises = batch.map(item => {
-          return checkIPRiskDetailWithRotation(item, activeKeys, setActiveKeys, modelId).then(res => ({
+          return checkIPRiskDetailWithRotation(item, activeKeys, setActiveKeys, currentModelId).then(res => ({
             id: item.id,
             finalRisk: res.risk,
             detail: res.detail
@@ -848,7 +867,20 @@ export default function App() {
                   <label className="block text-sm font-medium text-slate-700 mb-1">使用するAIモデル</label>
                   <select value={modelId} onChange={(e) => setModelId(e.target.value)} className="w-full px-4 py-2 border rounded-lg bg-white">
                     {MODELS.map(m => <option key={m.id} value={m.id}>{m.name}</option>)}
+                    <option value="custom">カスタムモデル (手動入力)</option>
                   </select>
+                  {modelId === 'custom' && (
+                    <div className="mt-2 flex items-center gap-2">
+                      <Edit3 className="w-4 h-4 text-slate-400" />
+                      <input 
+                        type="text" 
+                        value={customModelId} 
+                        onChange={(e) => setCustomModelId(e.target.value)} 
+                        className="flex-1 px-3 py-2 border rounded text-sm" 
+                        placeholder="例: gemini-1.5-flash-002" 
+                      />
+                    </div>
+                  )}
                   <p className="text-xs text-slate-500 mt-1">404エラーが出る場合はモデルを変更してください。</p>
                 </div>
                 <div>
@@ -857,7 +889,7 @@ export default function App() {
                     value={apiKeysText} 
                     onChange={(e) => setApiKeysText(e.target.value)} 
                     className="w-full px-4 py-2 border rounded-lg bg-slate-50 h-32 font-mono text-sm" 
-                    placeholder={`AIza...\nAIza...\nAIza...\n(キーを改行区切りで複数入力すると、エラーが出たキーを自動で排除して処理を継続します。)`}
+                    placeholder={`AIza...\nAIza...\nAIza...\n(キーを改行区切りで複数入力すると、負荷分散モードが作動します)`}
                   />
                   <div className="flex justify-between items-start mt-2">
                     <p className="text-xs text-slate-500">複数入力すると、エラーが出たキーを自動で排除して処理を継続します。<br/><span className="text-green-600 font-bold">APIキー接続テストボタンでキーの有効性を確認してください。</span></p>
