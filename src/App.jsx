@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { Upload, FileText, CheckCircle, Play, Download, Loader2, ShieldAlert, Pause, Trash2, Eye, Zap, FolderOpen, Lock, LogOut, History, Settings, Save, AlertTriangle, RefreshCw, Layers, Siren, Scale, SearchCheck, Activity, Cpu, Key, Ban, RotateCcw, Stethoscope, Check, X, Edit3 } from 'lucide-react';
+import { Upload, FileText, CheckCircle, Play, Download, Loader2, ShieldAlert, Pause, Trash2, Eye, Zap, FolderOpen, Lock, LogOut, History, Settings, Save, AlertTriangle, RefreshCw, Layers, Siren, Scale, SearchCheck, Activity, Cpu, Key, Ban, RotateCcw, Stethoscope, Check, X, Edit3, Flame } from 'lucide-react';
 import { initializeApp } from 'firebase/app';
 import { getFirestore, collection, addDoc, query, orderBy, limit, onSnapshot, serverTimestamp } from 'firebase/firestore';
 
@@ -22,7 +22,7 @@ const MODELS = [
   { id: 'gemini-1.5-flash-002', name: 'Gemini 1.5 Flash-002 (最新安定版)' },
   { id: 'gemini-1.5-flash-8b', name: 'Gemini 1.5 Flash-8B (超高速)' },
   { id: 'gemini-1.5-pro', name: 'Gemini 1.5 Pro (高精度)' },
-  { id: 'gemini-2.0-flash-exp', name: 'Gemini 2.0 Flash Exp (実験的)' },
+  { id: 'gemini-2.0-flash-exp', name: 'Gemini 2.0 Flash Exp (実験的・高速)' },
   { id: 'gemini-2.5-flash', name: 'Gemini 2.5 Flash (ダッシュボード表示用)' }, 
 ];
 
@@ -302,7 +302,6 @@ export default function App() {
     }
   }, []);
 
-  // テキストエリア変更時にのみ同期。処理中の除外はここに反映させない
   useEffect(() => {
     setActiveKeys(parseKeys(apiKeysText));
   }, [apiKeysText]);
@@ -341,15 +340,15 @@ export default function App() {
     alert("設定を保存しました");
   };
 
-  // 接続テスト (有効なキーだけを残してactiveKeysを更新する)
+  // 接続テスト (賢くフォールバックする)
   const testConnection = async () => {
     const keys = parseKeys(apiKeysText);
     if (keys.length === 0) return alert("APIキーが入力されていません");
     
     setKeyStatuses({});
     let results = {};
-    let validKeys = []; // 有効なキーのリスト
     
+    // 現在選択中のモデル (カスタムがあればそちら優先)
     const targetModel = modelId === 'custom' ? customModelId : modelId;
 
     for (const key of keys) {
@@ -357,6 +356,7 @@ export default function App() {
       setKeyStatuses({...results});
       
       try {
+        // まず選択中のモデルでテスト
         const url = `https://generativelanguage.googleapis.com/v1beta/models/${targetModel}:generateContent?key=${key}`;
         let res = await fetch(url, {
           method: 'POST',
@@ -365,9 +365,9 @@ export default function App() {
         });
         
         if (res.ok) {
-          results[key] = { status: 'ok', msg: `接続OK` };
-          validKeys.push(key);
+          results[key] = { status: 'ok', msg: `接続OK (${targetModel})` };
         } else if (res.status === 404) {
+          // 404なら安定版で再トライ
           const fallbackUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${key}`;
           const resFallback = await fetch(fallbackUrl, {
             method: 'POST',
@@ -377,7 +377,6 @@ export default function App() {
           
           if (resFallback.ok) {
              results[key] = { status: 'ok', msg: '1.5 Flashで接続OK' };
-             validKeys.push(key);
           } else {
              results[key] = { status: 'error', msg: '無効なキー' };
           }
@@ -388,11 +387,6 @@ export default function App() {
         results[key] = { status: 'error', msg: '通信エラー' };
       }
       setKeyStatuses({...results});
-    }
-    
-    // 接続テスト後は、有効なキーだけを稼働キーとしてセットする
-    if (validKeys.length > 0) {
-      setActiveKeys(validKeys);
     }
   };
 
@@ -467,15 +461,10 @@ export default function App() {
   };
 
   const startProcessing = async () => {
-    // 修正: 開始時にAPIキーを強制リセットせず、現在有効なキー（activeKeys）を使用する
-    // ただし、activeKeysが空の場合はテキストから再ロードする（初期状態対策）
-    let currentKeys = activeKeys;
-    if (currentKeys.length === 0 && apiKeysText) {
-      currentKeys = parseKeys(apiKeysText);
-      setActiveKeys(currentKeys);
-    }
+    const initialKeys = parseKeys(apiKeysText);
+    setActiveKeys(initialKeys);
 
-    if (currentKeys.length === 0) return alert("有効なAPIキーが設定されていません。設定画面でキーを確認するか、接続テストを行ってください。");
+    if (initialKeys.length === 0) return alert("有効なAPIキーが設定されていません。設定画面を確認してください。");
     if (csvData.length === 0) return;
 
     setIsProcessing(true);
@@ -490,7 +479,7 @@ export default function App() {
       errorCount: 0, 
       currentBatch: 0, 
       totalBatches: 0, 
-      deadKeysCount: parseKeys(apiKeysText).length - currentKeys.length
+      deadKeysCount: parseKeys(apiKeysText).length - initialKeys.length
     });
 
     const BULK_SIZE = 30; 
@@ -516,7 +505,7 @@ export default function App() {
         message: `並列処理中... (${currentIndex}/${total}件)`,
         currentBatch: currentBatchNum,
         totalBatches: totalBatches,
-        // アクティブキーの数をリアルタイム反映したいが、非同期State更新のためここでは近似値
+        deadKeysCount: parseKeys(apiKeysText).length - activeKeys.length 
       }));
 
       for (let c = 0; c < CONCURRENCY; c++) {
@@ -675,8 +664,8 @@ export default function App() {
       <div className="min-h-screen bg-slate-100 flex items-center justify-center p-4">
         <div className="bg-white p-16 rounded-2xl shadow-2xl w-full max-w-5xl transition-all border border-slate-200">
           <div className="flex flex-col items-center">
-            <div className="bg-blue-50 p-6 rounded-full mb-8"><Lock className="w-16 h-16 text-blue-600" /></div>
-            <h1 className="text-4xl font-extrabold text-center text-slate-800 mb-3 tracking-tight">IP Patrol Pro</h1>
+            <div className="bg-blue-50 p-6 rounded-full mb-8"><Flame className="w-16 h-16 text-blue-600" /></div>
+            <h1 className="text-4xl font-extrabold text-center text-slate-800 mb-3 tracking-tight">鬼バルクチェッカー</h1>
             <span className="text-sm font-bold bg-indigo-100 text-indigo-700 px-4 py-1.5 rounded-full mb-10">鬼バルクモード搭載</span>
           </div>
           <form onSubmit={handleLogin} className="space-y-8 max-w-xl mx-auto"> 
@@ -697,8 +686,8 @@ export default function App() {
       <nav className="bg-white border-b border-slate-200 sticky top-0 z-20 shadow-sm">
         <div className="max-w-7xl mx-auto px-4 h-16 flex items-center justify-between">
           <div className="flex items-center gap-2 font-bold text-slate-800 text-lg">
-            <ShieldAlert className="w-7 h-7 text-blue-600" />
-            <span>IP Patrol Pro <span className="text-xs font-normal text-indigo-600 bg-indigo-50 px-2 py-0.5 rounded-full ml-1">鬼バルクモード</span></span>
+            <Flame className="w-7 h-7 text-blue-600" />
+            <span>鬼バルクチェッカー <span className="text-xs font-normal text-indigo-600 bg-indigo-50 px-2 py-0.5 rounded-full ml-1">鬼バルクモード</span></span>
           </div>
           <div className="flex items-center gap-1">
             {['checker', 'history', 'settings'].map(tab => (
@@ -741,7 +730,7 @@ export default function App() {
                   <Ban className="w-5 h-5 text-rose-600" />
                   <div>
                     <p className="text-xs text-rose-600 font-bold">排除キー数</p>
-                    <p className="text-xl font-bold text-rose-700">{parseKeys(apiKeysText).length - activeKeys.length}</p>
+                    <p className="text-xl font-bold text-rose-700">{statusState.deadKeysCount}</p>
                   </div>
                 </div>
               </div>
