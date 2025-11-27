@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { Upload, FileText, CheckCircle, Play, Download, Loader2, ShieldAlert, Pause, Trash2, Eye, Zap, FolderOpen, Lock, LogOut, History, Settings, Save, AlertTriangle, RefreshCw, Layers, Siren, Scale, SearchCheck, Activity, Cpu, Key, Ban, RotateCcw, Stethoscope, Check, X, Edit3, Flame } from 'lucide-react';
+import { Upload, FileText, CheckCircle, Play, Download, Loader2, ShieldAlert, Pause, Trash2, Eye, Zap, FolderOpen, Lock, LogOut, Settings, Save, AlertTriangle, RefreshCw, Layers, Siren, Scale, SearchCheck, Activity, Cpu, Key, Ban, RotateCcw, Stethoscope, Check, X, Edit3, Flame, Rocket } from 'lucide-react';
 import { initializeApp } from 'firebase/app';
-import { getFirestore, collection, addDoc, query, orderBy, limit, onSnapshot, serverTimestamp } from 'firebase/firestore';
+import { getFirestore } from 'firebase/firestore';
 
 // ==========================================
 // 定数・設定
@@ -16,9 +16,15 @@ const RISK_MAP = {
   'Error': { label: 'エラー', color: 'bg-gray-200 text-gray-800 border-gray-300' }
 };
 
-// 標準モデルを 2.5 Flash に固定
+const MODELS = [
+  { id: 'gemini-2.5-flash', name: 'Gemini 2.5 Flash (最新・推奨)' },
+  { id: 'gemini-1.5-flash', name: 'Gemini 1.5 Flash (安定)' },
+  { id: 'gemini-1.5-flash-8b', name: 'Gemini 1.5 Flash-8B (軽量)' },
+  { id: 'gemini-1.5-pro', name: 'Gemini 1.5 Pro (高精度)' },
+  { id: 'gemini-2.0-flash-exp', name: 'Gemini 2.0 Flash Exp (実験的)' },
+];
+
 const DEFAULT_MODEL = 'gemini-2.5-flash';
-// 万が一 2.5 が動かない場合のバックアップ
 const FALLBACK_MODEL = 'gemini-1.5-flash';
 
 // ==========================================
@@ -104,7 +110,6 @@ JSON配列のみ:
 [{"id": ID, "risk_level": "Critical/High/Medium/Low", "reason": "短い理由"}, ...]
 `;
 
-  // フォールバック時は強制的に安定版(1.5-flash)を使う
   const currentModelId = isFallback ? FALLBACK_MODEL : (modelId || DEFAULT_MODEL);
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${currentModelId}:generateContent?key=${apiKey}`;
   
@@ -121,7 +126,6 @@ JSON配列のみ:
       body: JSON.stringify(payload)
     });
     
-    // 404: モデルエラー -> 安定版でリトライ (キーは捨てない)
     if (response.status === 404) {
       if (!isFallback && currentModelId !== FALLBACK_MODEL) {
         console.warn(`モデル(${currentModelId})404エラー。安定版(${FALLBACK_MODEL})で自動リトライします。`);
@@ -243,9 +247,8 @@ export default function App() {
   const [keyStatuses, setKeyStatuses] = useState({}); 
   
   const [firebaseConfigJson, setFirebaseConfigJson] = useState('');
-  // modelIdは内部的に保持するが、UIからは変更させない
   const [modelId, setModelId] = useState(DEFAULT_MODEL);
-  const [db, setDb] = useState(null);
+  const [customModelId, setCustomModelId] = useState(''); 
   
   const [activeTab, setActiveTab] = useState('checker');
   const [files, setFiles] = useState([]);
@@ -254,7 +257,6 @@ export default function App() {
   const [targetColIndex, setTargetColIndex] = useState(-1);
   
   const [results, setResults] = useState([]);
-  const [historyData, setHistoryData] = useState([]);
   const [isProcessing, setIsProcessing] = useState(false);
   const [isDetailAnalyzing, setIsDetailAnalyzing] = useState(false);
   const [progress, setProgress] = useState(0);
@@ -275,6 +277,8 @@ export default function App() {
   useEffect(() => {
     const savedKeys = localStorage.getItem('gemini_api_keys'); 
     const savedFbConfig = localStorage.getItem('firebase_config');
+    const savedModel = localStorage.getItem('gemini_model');
+    const savedCustomModel = localStorage.getItem('gemini_custom_model');
     const legacyKey = localStorage.getItem('gemini_api_key');
     
     if (savedKeys) {
@@ -285,34 +289,23 @@ export default function App() {
       setActiveKeys(parseKeys(legacyKey));
     }
 
-    // モデルは常に固定
-    setModelId(DEFAULT_MODEL);
-
+    // モデルは基本的にデフォルト(2.5)だが、カスタム保存があれば復元
+    if (savedModel) setModelId(savedModel);
+    if (savedCustomModel) setCustomModelId(savedCustomModel);
+    
+    // Firebase設定は保存されているが、初期化はエラー防止のためのダミー的なもの
     if (savedFbConfig) {
       setFirebaseConfigJson(savedFbConfig);
-      initFirebase(savedFbConfig);
+      try {
+        const config = JSON.parse(savedFbConfig);
+        initializeApp(config);
+      } catch (e) { console.warn("Firebase Init Warning:", e); }
     }
   }, []);
 
   useEffect(() => {
     setActiveKeys(parseKeys(apiKeysText));
   }, [apiKeysText]);
-
-  const initFirebase = (configStr) => {
-    try {
-      const config = JSON.parse(configStr);
-      const app = initializeApp(config);
-      const firestore = getFirestore(app);
-      setDb(firestore);
-      const q = query(collection(firestore, 'ip_checks'), orderBy('createdAt', 'desc'), limit(50));
-      onSnapshot(q, (snapshot) => {
-        const docs = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-        setHistoryData(docs);
-      });
-    } catch (e) {
-      console.warn("Firebase Init Warning:", e);
-    }
-  };
 
   const handleLogin = (e) => {
     e.preventDefault();
@@ -326,19 +319,20 @@ export default function App() {
   const saveSettings = () => {
     localStorage.setItem('gemini_api_keys', apiKeysText);
     localStorage.setItem('firebase_config', firebaseConfigJson);
-    // モデルは保存せず固定
-    if (firebaseConfigJson) initFirebase(firebaseConfigJson);
+    localStorage.setItem('gemini_model', modelId);
+    localStorage.setItem('gemini_custom_model', customModelId);
     alert("設定を保存しました");
   };
 
-  // 接続テスト
   const testConnection = async () => {
     const keys = parseKeys(apiKeysText);
     if (keys.length === 0) return alert("APIキーが入力されていません");
     
     setKeyStatuses({});
     let results = {};
-    const targetModel = DEFAULT_MODEL; // 固定モデルでテスト
+    let validKeys = [];
+    
+    const targetModel = modelId === 'custom' ? customModelId : modelId;
 
     for (const key of keys) {
       results[key] = { status: 'loading' };
@@ -354,8 +348,8 @@ export default function App() {
         
         if (res.ok) {
           results[key] = { status: 'ok', msg: `接続OK (${targetModel})` };
+          validKeys.push(key);
         } else if (res.status === 404) {
-          // 404なら安定版で再トライ
           const fallbackUrl = `https://generativelanguage.googleapis.com/v1beta/models/${FALLBACK_MODEL}:generateContent?key=${key}`;
           const resFallback = await fetch(fallbackUrl, {
             method: 'POST',
@@ -364,7 +358,8 @@ export default function App() {
           });
           
           if (resFallback.ok) {
-             results[key] = { status: 'ok', msg: `1.5 Flashで接続OK` };
+             results[key] = { status: 'ok', msg: `${FALLBACK_MODEL}でOK` };
+             validKeys.push(key);
           } else {
              results[key] = { status: 'error', msg: '無効なキー' };
           }
@@ -376,22 +371,9 @@ export default function App() {
       }
       setKeyStatuses({...results});
     }
-  };
-
-  const saveToHistory = async (item) => {
-    if (!db) return;
-    try {
-      if (['Critical', 'High', 'Medium'].includes(item.risk)) {
-        await addDoc(collection(db, 'ip_checks'), {
-          productName: item.productName,
-          risk: item.risk,
-          reason: item.detailedReason || item.reason, 
-          sourceFile: item.sourceFile,
-          createdAt: serverTimestamp()
-        });
-      }
-    } catch (e) {
-      console.error("Save Error", e);
+    
+    if (validKeys.length > 0) {
+      setActiveKeys(validKeys);
     }
   };
 
@@ -480,9 +462,7 @@ export default function App() {
     const initialJitter = Math.random() * 2000;
     await new Promise(resolve => setTimeout(resolve, initialJitter));
 
-    // 処理開始時は常にデフォルトモデル(2.5)からスタート
-    // 自動フォールバックはcheckIPRiskBulkWithRotation内でハンドリングされる
-    const currentModelId = DEFAULT_MODEL;
+    const currentModelId = modelId === 'custom' ? customModelId : modelId;
 
     while (currentIndex < total) {
       if (stopRef.current) break;
@@ -492,7 +472,7 @@ export default function App() {
       
       setStatusState(prev => ({
         ...prev,
-        message: `並列処理中... (${currentIndex}/${total}件)`,
+        message: `鬼バルクモード並列処理中... (${currentIndex}/${total}件)`,
         currentBatch: currentBatchNum,
         totalBatches: totalBatches,
         deadKeysCount: parseKeys(apiKeysText).length - activeKeys.length 
@@ -581,7 +561,7 @@ export default function App() {
     const totalRisky = riskyItems.length;
     let newResults = [...results];
     const CONCURRENCY = 5;
-    const currentModelId = DEFAULT_MODEL;
+    const currentModelId = modelId === 'custom' ? customModelId : modelId;
     
     setStatusState(prev => ({ ...prev, message: '詳細鑑定を開始します...', totalBatches: totalRisky, currentBatch: 0 }));
 
@@ -607,7 +587,6 @@ export default function App() {
           const index = newResults.findIndex(r => r.id === res.id);
           if (index !== -1) {
             newResults[index] = { ...newResults[index], risk: res.finalRisk, detailedReason: res.detail, isDetailed: true };
-            saveToHistory(newResults[index]);
           }
         });
         setResults([...newResults]); 
@@ -654,16 +633,16 @@ export default function App() {
       <div className="min-h-screen bg-slate-100 flex items-center justify-center p-4">
         <div className="bg-white p-16 rounded-2xl shadow-2xl w-full max-w-5xl transition-all border border-slate-200">
           <div className="flex flex-col items-center">
-            <div className="bg-blue-50 p-6 rounded-full mb-8"><Flame className="w-16 h-16 text-blue-600" /></div>
-            <h1 className="text-4xl font-extrabold text-center text-slate-800 mb-3 tracking-tight">鬼バルクチェッカー</h1>
-            <span className="text-sm font-bold bg-indigo-100 text-indigo-700 px-4 py-1.5 rounded-full mb-10">鬼バルクモード搭載</span>
+            <div className="bg-indigo-600 p-6 rounded-full mb-8 shadow-lg shadow-indigo-200"><Rocket className="w-16 h-16 text-white" /></div>
+            <h1 className="text-5xl font-black text-center text-slate-800 mb-2 tracking-tight">鬼バルクチェッカー <span className="text-2xl text-indigo-600">Ver.3</span></h1>
+            <span className="text-sm font-bold bg-slate-100 text-slate-500 px-4 py-1.5 rounded-full mb-10">Powered by Gemini 2.5 Flash | 20倍速の衝撃</span>
           </div>
           <form onSubmit={handleLogin} className="space-y-8 max-w-xl mx-auto"> 
             <div>
               <label className="block text-sm font-bold text-slate-600 mb-2">パスワード</label>
-              <input type="password" value={inputPassword} onChange={(e) => setInputPassword(e.target.value)} className="w-full px-6 py-4 border border-slate-300 rounded-xl focus:ring-4 focus:ring-blue-100 focus:border-blue-500 outline-none transition-all text-lg" placeholder="パスワードを入力" autoFocus />
+              <input type="password" value={inputPassword} onChange={(e) => setInputPassword(e.target.value)} className="w-full px-6 py-4 border border-slate-300 rounded-xl focus:ring-4 focus:ring-indigo-100 focus:border-indigo-500 outline-none transition-all text-lg" placeholder="パスワードを入力" autoFocus />
             </div>
-            <button type="submit" className="w-full bg-blue-600 text-white py-4 rounded-xl font-bold text-xl hover:bg-blue-700 shadow-xl shadow-blue-200 transition-all active:scale-95">ログインして開始</button>
+            <button type="submit" className="w-full bg-indigo-600 text-white py-4 rounded-xl font-bold text-xl hover:bg-indigo-700 shadow-xl shadow-indigo-200 transition-all active:scale-95">ログインして開始</button>
           </form>
           <p className="text-center text-xs text-slate-400 mt-12 font-mono">Authorized Personnel Only</p>
         </div>
@@ -675,14 +654,14 @@ export default function App() {
     <div className="min-h-screen bg-slate-50 font-sans text-slate-800">
       <nav className="bg-white border-b border-slate-200 sticky top-0 z-20 shadow-sm">
         <div className="max-w-7xl mx-auto px-4 h-16 flex items-center justify-between">
-          <div className="flex items-center gap-2 font-bold text-slate-800 text-lg">
-            <Flame className="w-7 h-7 text-blue-600" />
-            <span>鬼バルクチェッカー <span className="text-xs font-normal text-indigo-600 bg-indigo-50 px-2 py-0.5 rounded-full ml-1">鬼バルクモード</span></span>
+          <div className="flex items-center gap-3 font-black text-slate-800 text-xl">
+            <Rocket className="w-8 h-8 text-indigo-600" />
+            <span>鬼バルクチェッカー <span className="text-xs font-medium text-white bg-indigo-600 px-2 py-0.5 rounded ml-1">Ver.3</span></span>
           </div>
           <div className="flex items-center gap-1">
-            {['checker', 'history', 'settings'].map(tab => (
-              <button key={tab} onClick={() => setActiveTab(tab)} className={`px-4 py-2 rounded-lg text-sm font-medium transition-colors ${activeTab === tab ? 'bg-blue-50 text-blue-600' : 'text-slate-500 hover:bg-slate-50'}`}>
-                {tab === 'checker' ? 'チェック' : tab === 'history' ? '履歴' : '設定'}
+            {['checker', 'settings'].map(tab => (
+              <button key={tab} onClick={() => setActiveTab(tab)} className={`px-4 py-2 rounded-lg text-sm font-medium transition-colors ${activeTab === tab ? 'bg-indigo-50 text-indigo-600' : 'text-slate-500 hover:bg-slate-50'}`}>
+                {tab === 'checker' ? 'チェック' : '設定'}
               </button>
             ))}
             <button onClick={() => setIsAuthenticated(false)} className="ml-2 p-2 text-slate-400 hover:text-red-500"><LogOut className="w-5 h-5" /></button>
@@ -757,10 +736,10 @@ export default function App() {
                   </div>
                   <div onClick={() => setIsHighSpeed(!isHighSpeed)} className={`p-4 rounded-lg border cursor-pointer transition-all ${isHighSpeed ? 'bg-indigo-50 border-indigo-200 ring-2 ring-indigo-100' : 'bg-white border-slate-200'}`}>
                     <div className="flex items-center justify-between mb-2">
-                      <div className="flex items-center gap-2"><Layers className={`w-5 h-5 ${isHighSpeed ? 'text-indigo-600' : 'text-slate-400'}`} /><span className={`font-bold text-sm ${isHighSpeed ? 'text-indigo-900' : 'text-slate-600'}`}>鬼バルクモード</span></div>
+                      <div className="flex items-center gap-2"><Flame className={`w-5 h-5 ${isHighSpeed ? 'text-indigo-600 fill-indigo-600' : 'text-slate-400'}`} /><span className={`font-bold text-sm ${isHighSpeed ? 'text-indigo-900' : 'text-slate-600'}`}>鬼バルクモード</span></div>
                       <div className={`w-10 h-5 rounded-full relative transition-colors ${isHighSpeed ? 'bg-indigo-600' : 'bg-slate-300'}`}><div className={`absolute top-1 w-3 h-3 bg-white rounded-full transition-transform ${isHighSpeed ? 'left-6' : 'left-1'}`} /></div>
                     </div>
-                    <p className="text-xs text-slate-500">見逃し厳禁・鬼検閲官による一括判定。疑わしいものは全て警告します。</p>
+                    <p className="text-xs text-slate-500">通常速度の20倍。リミッター解除・鬼検閲官による一括判定。</p>
                   </div>
                 </div>
               </div>
@@ -773,7 +752,7 @@ export default function App() {
                       <span>{progress}%</span>
                     </div>
                     <div className="bg-slate-100 rounded-full h-3 overflow-hidden">
-                      <div className="h-full bg-gradient-to-r from-blue-500 to-indigo-600 transition-all duration-300" style={{ width: `${progress}%` }} />
+                      <div className="h-full bg-gradient-to-r from-indigo-500 to-purple-600 transition-all duration-300" style={{ width: `${progress}%` }} />
                     </div>
                   </div>
                   
@@ -782,7 +761,7 @@ export default function App() {
                       {results.length > 0 ? (
                         <button onClick={handleReset} className="flex items-center gap-2 px-8 py-3 bg-slate-600 hover:bg-slate-700 text-white font-bold rounded-lg shadow-md transition-transform active:scale-95 whitespace-nowrap"><RotateCcw className="w-5 h-5" /> 次のファイルをチェック</button>
                       ) : (
-                        <button onClick={startProcessing} disabled={files.length === 0} className="flex items-center gap-2 px-8 py-3 bg-blue-600 hover:bg-blue-700 disabled:bg-slate-300 text-white font-bold rounded-lg shadow-md transition-transform active:scale-95 whitespace-nowrap"><Play className="w-5 h-5" /> 一次審査開始</button>
+                        <button onClick={startProcessing} disabled={files.length === 0} className="flex items-center gap-2 px-8 py-3 bg-indigo-600 hover:bg-indigo-700 disabled:bg-slate-300 text-white font-bold rounded-lg shadow-md transition-transform active:scale-95 whitespace-nowrap"><Play className="w-5 h-5" /> 鬼チェック開始</button>
                       )}
                     </div>
                   ) : (
@@ -792,7 +771,6 @@ export default function App() {
               </div>
             </div>
 
-            {/* ダブルチェックアクション */}
             {results.filter(r => ['Critical', 'High', 'Medium'].includes(r.risk)).length > 0 && !isProcessing && (
               <div className="bg-indigo-50 border border-indigo-100 rounded-xl p-6 flex flex-col md:flex-row items-center justify-between gap-4 animate-in slide-in-from-top-2">
                 <div className="flex items-start gap-3">
@@ -852,10 +830,23 @@ export default function App() {
               <div className="space-y-4">
                 <div>
                   <label className="block text-sm font-medium text-slate-700 mb-1">使用するAIモデル</label>
-                  <div className="w-full px-4 py-2 border rounded-lg bg-slate-100 text-slate-500 font-mono text-sm">
-                    {MODELS.find(m => m.id === DEFAULT_MODEL)?.name || DEFAULT_MODEL} (固定)
-                  </div>
-                  <p className="text-xs text-slate-500 mt-1">モデルは管理者設定により固定されています。</p>
+                  <select value={modelId} onChange={(e) => setModelId(e.target.value)} className="w-full px-4 py-2 border rounded-lg bg-white">
+                    {MODELS.map(m => <option key={m.id} value={m.id}>{m.name}</option>)}
+                    <option value="custom">カスタムモデル (手動入力)</option>
+                  </select>
+                  {modelId === 'custom' && (
+                    <div className="mt-2 flex items-center gap-2">
+                      <Edit3 className="w-4 h-4 text-slate-400" />
+                      <input 
+                        type="text" 
+                        value={customModelId} 
+                        onChange={(e) => setCustomModelId(e.target.value)} 
+                        className="flex-1 px-3 py-2 border rounded text-sm" 
+                        placeholder="例: gemini-1.5-flash-002" 
+                      />
+                    </div>
+                  )}
+                  <p className="text-xs text-slate-500 mt-1">デフォルト推奨: Gemini 2.5 Flash (404エラー時は自動で1.5に切り替わります)</p>
                 </div>
                 <div>
                   <label className="block text-sm font-medium text-slate-700 mb-1">Gemini API Keys (複数登録推奨)</label>
