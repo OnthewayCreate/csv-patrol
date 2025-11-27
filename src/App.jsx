@@ -53,13 +53,31 @@ const readFileAsText = (file, encoding) => {
   });
 };
 
+// AIのレスポンスからJSON部分だけを抽出するクリーニング関数
+const cleanJson = (text) => {
+  try {
+    // Markdownのコードブロック記号を削除
+    let cleaned = text.replace(/```json/g, '').replace(/```/g, '');
+    cleaned = cleaned.trim();
+    // 配列の開始と終了を探して抽出
+    const start = cleaned.indexOf('[');
+    const end = cleaned.lastIndexOf(']');
+    if (start !== -1 && end !== -1) {
+      return cleaned.substring(start, end + 1);
+    }
+    return cleaned;
+  } catch (e) {
+    return text;
+  }
+};
+
 // ==========================================
 // 2. API呼び出し関数
 // ==========================================
 
 /**
  * 1. 一次審査: 複数の商品を一度に判定するバルク処理
- * 「見逃し厳禁」モード + 多重タブ対応強化版
+ * 「見逃し厳禁」モード + 堅牢なエラーハンドリング
  */
 async function checkIPRiskBulk(products, apiKey, retryCount = 0) {
   // 入力リストの作成
@@ -99,7 +117,7 @@ async function checkIPRiskBulk(products, apiKey, retryCount = 0) {
 理由が全く見つからない場合のみ、「Low」としてください。
 
 【出力形式】
-JSON配列のみを出力してください。
+JSON配列のみを出力してください。Markdown記法は不要です。
 [
   {"id": 入力されたID, "risk_level": "Critical/High/Medium/Low", "reason": "短い日本語での指摘(なぜ疑ったか)"},
   ...
@@ -123,42 +141,48 @@ JSON配列のみを出力してください。
       body: JSON.stringify(payload)
     });
     
+    // レート制限 (429) 対応
     if (response.status === 429) {
-      if (retryCount < 20) { 
-        const baseWait = Math.pow(1.4, retryCount + 1) * 2000;
-        const jitter = Math.random() * 5000; 
-        const waitTime = Math.min(baseWait + jitter, 60000); 
+      if (retryCount < 10) { 
+        // 指数バックオフ + ランダムゆらぎ
+        const baseWait = Math.pow(1.5, retryCount + 1) * 1000;
+        const jitter = Math.random() * 2000;
+        const waitTime = Math.min(baseWait + jitter, 30000); // 最大30秒待機
 
-        console.warn(`API制限検知(Bulk)。${Math.round(waitTime)}ms 待機後にリトライします (${retryCount + 1}/20)`);
+        console.warn(`API制限検知。${Math.round(waitTime)}ms 待機後にリトライします (${retryCount + 1}/10)`);
         await new Promise(resolve => setTimeout(resolve, waitTime));
         return checkIPRiskBulk(products, apiKey, retryCount + 1);
       } else { 
-        throw new Error("API混雑により判定できませんでした(Max Retry Exceeded)"); 
+        throw new Error("API混雑により判定できませんでした"); 
       }
     }
     
     if (!response.ok) throw new Error(`API Error: ${response.status}`);
     
     const data = await response.json();
-    const text = data.candidates?.[0]?.content?.parts?.[0]?.text;
-    if (!text) throw new Error("No response");
+    const rawText = data.candidates?.[0]?.content?.parts?.[0]?.text;
+    if (!rawText) throw new Error("No response");
     
+    // JSONクリーニングとパース
+    const cleanText = cleanJson(rawText);
     let parsedResults;
     try {
-      parsedResults = JSON.parse(text);
+      parsedResults = JSON.parse(cleanText);
       if (!Array.isArray(parsedResults)) throw new Error("レスポンスが配列ではありません");
     } catch (e) {
+      console.error("JSON Parse Error:", e, cleanText);
       throw new Error("AIレスポンスの解析に失敗しました");
     }
 
     const resultMap = {};
     parsedResults.forEach(item => {
       let risk = item.risk_level;
+      // 表記ゆれ吸収
       if (risk === '危険') risk = 'Critical';
       if (risk === '高') risk = 'High';
       if (risk === '中') risk = 'Medium';
       if (risk === '低') risk = 'Low';
-      if (!risk) risk = 'Medium'; 
+      if (!risk) risk = 'Medium'; // デフォルトはMedium（安全側）
       
       resultMap[item.id] = { risk, reason: item.reason };
     });
@@ -166,14 +190,18 @@ JSON配列のみを出力してください。
     return resultMap;
 
   } catch (error) {
-    if (retryCount < 5) {
-        const waitTime = 3000 + Math.random() * 3000;
+    console.error("Bulk Check Error:", error);
+    // 致命的なエラーでもリトライ回数が残っていればリトライ
+    if (retryCount < 3 && !error.message.includes("429")) {
+        const waitTime = 2000 + Math.random() * 2000;
         await new Promise(resolve => setTimeout(resolve, waitTime));
         return checkIPRiskBulk(products, apiKey, retryCount + 1);
     }
+    
+    // どうしてもダメな場合は、全件エラーとして返す（処理を止めないため）
     const errorMap = {};
     products.forEach(p => {
-      errorMap[p.id] = { risk: "Error", reason: error.message };
+      errorMap[p.id] = { risk: "Error", reason: `判定エラー: ${error.message}` };
     });
     return errorMap;
   }
@@ -181,7 +209,6 @@ JSON配列のみを出力してください。
 
 /**
  * 2. 二次審査: 個別の商品を深掘り判定する詳細処理
- * 「弁護士」モード
  */
 async function checkIPRiskDetail(product, apiKey, retryCount = 0) {
   const systemInstruction = `
@@ -222,17 +249,19 @@ JSONのみを出力してください。
     });
     
     if (response.status === 429) {
-      if (retryCount < 15) { 
-        const waitTime = Math.pow(1.5, retryCount + 1) * 2000 + Math.random() * 3000;
+      if (retryCount < 10) { 
+        const waitTime = Math.pow(1.5, retryCount + 1) * 2000 + Math.random() * 2000;
         await new Promise(resolve => setTimeout(resolve, waitTime));
         return checkIPRiskDetail(product, apiKey, retryCount + 1);
       } else { throw new Error("API混雑"); }
     }
     
     if (!response.ok) throw new Error(`API Error: ${response.status}`);
+    
     const data = await response.json();
-    const text = data.candidates?.[0]?.content?.parts?.[0]?.text;
-    const result = JSON.parse(text);
+    const rawText = data.candidates?.[0]?.content?.parts?.[0]?.text;
+    const cleanText = cleanJson(rawText);
+    const result = JSON.parse(cleanText);
     
     let risk = result.final_risk;
     if (risk === '危険') risk = 'Critical';
@@ -270,6 +299,7 @@ export default function App() {
   const [progress, setProgress] = useState(0);
   const [encoding, setEncoding] = useState('Shift_JIS');
   
+  // デフォルトで高速モードON
   const [isHighSpeed, setIsHighSpeed] = useState(true); 
   
   const stopRef = useRef(false);
@@ -372,6 +402,7 @@ export default function App() {
     setCsvData(prev => [...prev, ...newRows]);
   };
 
+  // --- 一次審査（バルク） ---
   const startProcessing = async () => {
     if (!apiKey) return alert("設定画面でAPIキーを入力してください");
     if (csvData.length === 0) return;
@@ -381,13 +412,17 @@ export default function App() {
     stopRef.current = false;
     setResults([]); 
 
-    const BULK_SIZE = 20; 
-    const CONCURRENCY = isHighSpeed ? 5 : 2;
+    // === 鬼バルクモード設定（最適化済み） ===
+    // BULK_SIZE: 30件 (Gemini 2.0なら余裕で、かつ速度が出る)
+    const BULK_SIZE = 30; 
+    // CONCURRENCY: 3並列 (多すぎると429エラーで逆に遅くなるため、3が黄金比)
+    const CONCURRENCY = isHighSpeed ? 3 : 2;
 
     let currentIndex = 0;
     const total = csvData.length;
 
-    const initialJitter = Math.random() * 3000;
+    // 初動の分散（多重タブ対策）
+    const initialJitter = Math.random() * 2000;
     await new Promise(resolve => setTimeout(resolve, initialJitter));
 
     while (currentIndex < total) {
@@ -413,6 +448,7 @@ export default function App() {
         }
         
         if (chunkProducts.length > 0) {
+          // エラーが発生してもcatch内で処理され、必ず結果が返ってくるように設計
           tasks.push(
             checkIPRiskBulk(chunkProducts, apiKey).then(resultMap => {
               return chunkProducts.map(p => ({
@@ -429,22 +465,24 @@ export default function App() {
       }
 
       if (tasks.length > 0) {
+        // 並列処理の完了を待つ
         const chunkResults = await Promise.all(tasks);
         const flatResults = chunkResults.flat();
+        
+        // 結果を画面に追加
         setResults(prev => [...prev, ...flatResults]);
         
-        currentIndex += tasks.reduce((acc, _, idx) => {
-           const processedInTask = Math.min(currentIndex + ((idx + 1) * BULK_SIZE), total) - (currentIndex + (idx * BULK_SIZE));
-           return acc + (processedInTask > 0 ? processedInTask : 0);
-        }, 0);
+        // 進捗を更新
+        const processedCount = flatResults.length;
+        currentIndex += processedCount; // 実際に処理した数だけ進める
         
-        const nextProgress = Math.min(currentIndex + (CONCURRENCY * BULK_SIZE), total);
-        setProgress(Math.round((nextProgress / total) * 100));
-        currentIndex = nextProgress;
+        const nextProgress = Math.round((currentIndex / total) * 100);
+        setProgress(nextProgress);
       }
 
-      const baseWait = isHighSpeed ? 500 : 2000;
-      const jitter = Math.random() * 1000;
+      // 次のバッチへのインターバル（API制限回避）
+      const baseWait = isHighSpeed ? 300 : 1500;
+      const jitter = Math.random() * 500;
       if (currentIndex < total) {
         await new Promise(resolve => setTimeout(resolve, baseWait + jitter));
       }
@@ -454,6 +492,7 @@ export default function App() {
     setIsProcessing(false);
   };
 
+  // --- 二次審査（詳細分析） ---
   const startDetailAnalysis = async () => {
     if (!apiKey) return;
     setIsDetailAnalyzing(true);
@@ -548,7 +587,6 @@ export default function App() {
   if (!isAuthenticated) {
     return (
       <div className="min-h-screen bg-slate-100 flex items-center justify-center p-4">
-        {/* 幅を5xlまで拡張、余白を大幅増、PC向けに堂々としたデザインへ変更 */}
         <div className="bg-white p-16 rounded-2xl shadow-2xl w-full max-w-5xl transition-all border border-slate-200">
           <div className="flex flex-col items-center">
             <div className="bg-blue-50 p-6 rounded-full mb-8">
