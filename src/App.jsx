@@ -16,17 +16,10 @@ const RISK_MAP = {
   'Error': { label: 'エラー', color: 'bg-gray-200 text-gray-800 border-gray-300' }
 };
 
-const MODELS = [
-  { id: 'gemini-1.5-flash', name: 'Gemini 1.5 Flash (推奨・安定)' },
-  { id: 'gemini-1.5-flash-001', name: 'Gemini 1.5 Flash-001 (安定版)' },
-  { id: 'gemini-1.5-flash-002', name: 'Gemini 1.5 Flash-002 (最新安定版)' },
-  { id: 'gemini-1.5-flash-8b', name: 'Gemini 1.5 Flash-8B (超高速)' },
-  { id: 'gemini-1.5-pro', name: 'Gemini 1.5 Pro (高精度)' },
-  { id: 'gemini-2.0-flash-exp', name: 'Gemini 2.0 Flash Exp (実験的・高速)' },
-  { id: 'gemini-2.5-flash', name: 'Gemini 2.5 Flash (ダッシュボード表示用)' }, 
-];
-
-const DEFAULT_MODEL = 'gemini-1.5-flash';
+// 標準モデルを 2.5 Flash に固定
+const DEFAULT_MODEL = 'gemini-2.5-flash';
+// 万が一 2.5 が動かない場合のバックアップ
+const FALLBACK_MODEL = 'gemini-1.5-flash';
 
 // ==========================================
 // 1. ユーティリティ
@@ -111,7 +104,8 @@ JSON配列のみ:
 [{"id": ID, "risk_level": "Critical/High/Medium/Low", "reason": "短い理由"}, ...]
 `;
 
-  const currentModelId = isFallback ? DEFAULT_MODEL : (modelId || DEFAULT_MODEL);
+  // フォールバック時は強制的に安定版(1.5-flash)を使う
+  const currentModelId = isFallback ? FALLBACK_MODEL : (modelId || DEFAULT_MODEL);
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${currentModelId}:generateContent?key=${apiKey}`;
   
   const payload = {
@@ -127,11 +121,11 @@ JSON配列のみ:
       body: JSON.stringify(payload)
     });
     
-    // 404: モデルエラー -> デフォルトモデルでリトライ
+    // 404: モデルエラー -> 安定版でリトライ (キーは捨てない)
     if (response.status === 404) {
-      if (!isFallback && currentModelId !== DEFAULT_MODEL) {
-        console.warn(`モデル(${currentModelId})404エラー。標準(${DEFAULT_MODEL})でリトライします。`);
-        return checkIPRiskBulkWithRotation(products, availableKeys, setAvailableKeys, DEFAULT_MODEL, true);
+      if (!isFallback && currentModelId !== FALLBACK_MODEL) {
+        console.warn(`モデル(${currentModelId})404エラー。安定版(${FALLBACK_MODEL})で自動リトライします。`);
+        return checkIPRiskBulkWithRotation(products, availableKeys, setAvailableKeys, FALLBACK_MODEL, true);
       }
     }
 
@@ -185,7 +179,7 @@ async function checkIPRiskDetailWithRotation(product, availableKeys, setAvailabl
   if (availableKeys.length === 0) return { risk: product.risk, detail: "APIキー切れ" };
   
   const apiKey = availableKeys[Math.floor(Math.random() * availableKeys.length)];
-  const currentModelId = isFallback ? DEFAULT_MODEL : (modelId || DEFAULT_MODEL);
+  const currentModelId = isFallback ? FALLBACK_MODEL : (modelId || DEFAULT_MODEL);
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${currentModelId}:generateContent?key=${apiKey}`;
   
   const systemInstruction = `あなたは知的財産権弁護士です。以下の商品のリスクを再鑑定し、JSONで出力してください。`;
@@ -203,8 +197,8 @@ async function checkIPRiskDetailWithRotation(product, availableKeys, setAvailabl
     });
     
     if (response.status === 404) {
-       if (!isFallback && currentModelId !== DEFAULT_MODEL) {
-         return checkIPRiskDetailWithRotation(product, availableKeys, setAvailableKeys, DEFAULT_MODEL, true);
+       if (!isFallback && currentModelId !== FALLBACK_MODEL) {
+         return checkIPRiskDetailWithRotation(product, availableKeys, setAvailableKeys, FALLBACK_MODEL, true);
        }
     }
 
@@ -249,8 +243,8 @@ export default function App() {
   const [keyStatuses, setKeyStatuses] = useState({}); 
   
   const [firebaseConfigJson, setFirebaseConfigJson] = useState('');
+  // modelIdは内部的に保持するが、UIからは変更させない
   const [modelId, setModelId] = useState(DEFAULT_MODEL);
-  const [customModelId, setCustomModelId] = useState(''); 
   const [db, setDb] = useState(null);
   
   const [activeTab, setActiveTab] = useState('checker');
@@ -281,8 +275,6 @@ export default function App() {
   useEffect(() => {
     const savedKeys = localStorage.getItem('gemini_api_keys'); 
     const savedFbConfig = localStorage.getItem('firebase_config');
-    const savedModel = localStorage.getItem('gemini_model');
-    const savedCustomModel = localStorage.getItem('gemini_custom_model');
     const legacyKey = localStorage.getItem('gemini_api_key');
     
     if (savedKeys) {
@@ -293,9 +285,9 @@ export default function App() {
       setActiveKeys(parseKeys(legacyKey));
     }
 
-    if (savedModel) setModelId(savedModel);
-    if (savedCustomModel) setCustomModelId(savedCustomModel);
-    
+    // モデルは常に固定
+    setModelId(DEFAULT_MODEL);
+
     if (savedFbConfig) {
       setFirebaseConfigJson(savedFbConfig);
       initFirebase(savedFbConfig);
@@ -334,29 +326,25 @@ export default function App() {
   const saveSettings = () => {
     localStorage.setItem('gemini_api_keys', apiKeysText);
     localStorage.setItem('firebase_config', firebaseConfigJson);
-    localStorage.setItem('gemini_model', modelId);
-    localStorage.setItem('gemini_custom_model', customModelId);
+    // モデルは保存せず固定
     if (firebaseConfigJson) initFirebase(firebaseConfigJson);
     alert("設定を保存しました");
   };
 
-  // 接続テスト (賢くフォールバックする)
+  // 接続テスト
   const testConnection = async () => {
     const keys = parseKeys(apiKeysText);
     if (keys.length === 0) return alert("APIキーが入力されていません");
     
     setKeyStatuses({});
     let results = {};
-    
-    // 現在選択中のモデル (カスタムがあればそちら優先)
-    const targetModel = modelId === 'custom' ? customModelId : modelId;
+    const targetModel = DEFAULT_MODEL; // 固定モデルでテスト
 
     for (const key of keys) {
       results[key] = { status: 'loading' };
       setKeyStatuses({...results});
       
       try {
-        // まず選択中のモデルでテスト
         const url = `https://generativelanguage.googleapis.com/v1beta/models/${targetModel}:generateContent?key=${key}`;
         let res = await fetch(url, {
           method: 'POST',
@@ -368,7 +356,7 @@ export default function App() {
           results[key] = { status: 'ok', msg: `接続OK (${targetModel})` };
         } else if (res.status === 404) {
           // 404なら安定版で再トライ
-          const fallbackUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${key}`;
+          const fallbackUrl = `https://generativelanguage.googleapis.com/v1beta/models/${FALLBACK_MODEL}:generateContent?key=${key}`;
           const resFallback = await fetch(fallbackUrl, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -376,7 +364,7 @@ export default function App() {
           });
           
           if (resFallback.ok) {
-             results[key] = { status: 'ok', msg: '1.5 Flashで接続OK' };
+             results[key] = { status: 'ok', msg: `1.5 Flashで接続OK` };
           } else {
              results[key] = { status: 'error', msg: '無効なキー' };
           }
@@ -492,7 +480,9 @@ export default function App() {
     const initialJitter = Math.random() * 2000;
     await new Promise(resolve => setTimeout(resolve, initialJitter));
 
-    const currentModelId = modelId === 'custom' ? customModelId : modelId;
+    // 処理開始時は常にデフォルトモデル(2.5)からスタート
+    // 自動フォールバックはcheckIPRiskBulkWithRotation内でハンドリングされる
+    const currentModelId = DEFAULT_MODEL;
 
     while (currentIndex < total) {
       if (stopRef.current) break;
@@ -591,7 +581,7 @@ export default function App() {
     const totalRisky = riskyItems.length;
     let newResults = [...results];
     const CONCURRENCY = 5;
-    const currentModelId = modelId === 'custom' ? customModelId : modelId;
+    const currentModelId = DEFAULT_MODEL;
     
     setStatusState(prev => ({ ...prev, message: '詳細鑑定を開始します...', totalBatches: totalRisky, currentBatch: 0 }));
 
@@ -862,23 +852,10 @@ export default function App() {
               <div className="space-y-4">
                 <div>
                   <label className="block text-sm font-medium text-slate-700 mb-1">使用するAIモデル</label>
-                  <select value={modelId} onChange={(e) => setModelId(e.target.value)} className="w-full px-4 py-2 border rounded-lg bg-white">
-                    {MODELS.map(m => <option key={m.id} value={m.id}>{m.name}</option>)}
-                    <option value="custom">カスタムモデル (手動入力)</option>
-                  </select>
-                  {modelId === 'custom' && (
-                    <div className="mt-2 flex items-center gap-2">
-                      <Edit3 className="w-4 h-4 text-slate-400" />
-                      <input 
-                        type="text" 
-                        value={customModelId} 
-                        onChange={(e) => setCustomModelId(e.target.value)} 
-                        className="flex-1 px-3 py-2 border rounded text-sm" 
-                        placeholder="例: gemini-1.5-flash-002" 
-                      />
-                    </div>
-                  )}
-                  <p className="text-xs text-slate-500 mt-1">404エラーが出る場合はモデルを変更してください。</p>
+                  <div className="w-full px-4 py-2 border rounded-lg bg-slate-100 text-slate-500 font-mono text-sm">
+                    {MODELS.find(m => m.id === DEFAULT_MODEL)?.name || DEFAULT_MODEL} (固定)
+                  </div>
+                  <p className="text-xs text-slate-500 mt-1">モデルは管理者設定により固定されています。</p>
                 </div>
                 <div>
                   <label className="block text-sm font-medium text-slate-700 mb-1">Gemini API Keys (複数登録推奨)</label>
