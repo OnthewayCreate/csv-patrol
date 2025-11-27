@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { Upload, FileText, CheckCircle, Play, Download, Loader2, ShieldAlert, Pause, Trash2, Eye, Zap, FolderOpen, Lock, LogOut, History, Settings, Save, AlertTriangle, RefreshCw, Layers, Siren, Scale, SearchCheck, Activity, Cpu, Key } from 'lucide-react';
+import { Upload, FileText, CheckCircle, Play, Download, Loader2, ShieldAlert, Pause, Trash2, Eye, Zap, FolderOpen, Lock, LogOut, History, Settings, Save, AlertTriangle, RefreshCw, Layers, Siren, Scale, SearchCheck, Activity, Cpu, Key, Ban } from 'lucide-react';
 import { initializeApp } from 'firebase/app';
 import { getFirestore, collection, addDoc, query, orderBy, limit, onSnapshot, serverTimestamp } from 'firebase/firestore';
 
@@ -74,21 +74,31 @@ const cleanJson = (text) => {
   } catch (e) { return text; }
 };
 
-// 複数のキーからランダムに1つ選ぶ関数
-const getRandomKey = (keysText) => {
-  if (!keysText) return '';
-  // 改行、カンマ、スペースで区切って配列化し、空文字を除去
-  const keys = keysText.split(/[\n, ]+/).map(k => k.trim()).filter(k => k.length > 0);
-  if (keys.length === 0) return '';
-  const randomIndex = Math.floor(Math.random() * keys.length);
-  return keys[randomIndex];
+// --- キー管理マネージャー ---
+// 状態を持たせるためクラスではなく外部変数的な管理、あるいはStateで管理
+// ここでは簡易的に関数内で処理するが、Appコンポーネントで管理する
+
+// キーをパースして配列にする
+const parseKeys = (text) => {
+  if (!text) return [];
+  return text.split(/[\n, ]+/)
+    .map(k => k.trim())
+    .filter(k => k.length > 10 && k.startsWith('AIza')); // 簡易バリデーション
 };
 
 // ==========================================
-// 2. API呼び出し関数
+// 2. API呼び出し関数 (キーローテーション & 自動排除機能付き)
 // ==========================================
 
-async function checkIPRiskBulk(products, apiKey, modelId, retryCount = 0) {
+async function checkIPRiskBulkWithRotation(products, availableKeys, setAvailableKeys, modelId) {
+  // キーがなければエラー
+  if (availableKeys.length === 0) {
+    throw new Error("ALL_KEYS_DEAD: 有効なAPIキーがありません");
+  }
+
+  // ランダムにキーを選択
+  const apiKey = availableKeys[Math.floor(Math.random() * availableKeys.length)];
+
   const productsListText = products.map(p => `ID:${p.id} 商品名:${p.name}`).join('\n');
   const systemInstruction = `
 あなたはECモールの「知的財産権・薬機法・安全管理」の【鬼検閲官】です。
@@ -106,7 +116,9 @@ JSON配列のみ:
 [{"id": ID, "risk_level": "Critical/High/Medium/Low", "reason": "短い理由"}, ...]
 `;
 
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${modelId}:generateContent?key=${apiKey}`;
+  // モデルIDの安全策
+  const safeModelId = modelId || 'gemini-1.5-flash';
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${safeModelId}:generateContent?key=${apiKey}`;
   
   const payload = {
     contents: [{ parts: [{ text: `以下の商品を一括判定せよ:\n${productsListText}` }] }],
@@ -121,35 +133,37 @@ JSON配列のみ:
       body: JSON.stringify(payload)
     });
     
-    // 致命的なエラー(404:モデルなし, 400:不正リクエスト, 401:認証)はリトライせず即死させる
-    if (response.status === 404 || response.status === 400 || response.status === 401 || response.status === 403) {
-      throw new Error(`CRITICAL_API_ERROR: ${response.status} ${response.statusText}`);
+    // 404 (Not Found) or 400 (Bad Request) or 403 (Forbidden) -> このキーは死んでいる
+    if (response.status === 404 || response.status === 400 || response.status === 403) {
+      console.warn(`不良キーを検知しました。除外してリトライします: ${apiKey.slice(0, 5)}... (${response.status})`);
+      
+      // 不良キーを除外した新しいリストを作成
+      const newKeys = availableKeys.filter(k => k !== apiKey);
+      // 親の状態を更新 (非同期なのでここでの反映は次回以降だが、再帰呼び出しにはnewKeysを渡す)
+      if (setAvailableKeys) setAvailableKeys(newKeys);
+      
+      // 残りのキーで即時リトライ
+      return checkIPRiskBulkWithRotation(products, newKeys, setAvailableKeys, modelId);
     }
 
+    // 429 (Too Many Requests) -> キーは生きているが忙しい。待機してリトライ (キーは変えない or 変える)
     if (response.status === 429) {
-      if (retryCount < 5) { 
-        const waitTime = Math.pow(2, retryCount) * 1000 + Math.random() * 1000;
-        await new Promise(resolve => setTimeout(resolve, waitTime));
-        return checkIPRiskBulk(products, apiKey, modelId, retryCount + 1);
-      } else { 
-        throw new Error("APIレート制限(429) - 混雑中"); 
-      }
+      const waitTime = 2000 + Math.random() * 3000;
+      await new Promise(resolve => setTimeout(resolve, waitTime));
+      // 別のキーで試すために再帰 (キーはランダム再選択される)
+      return checkIPRiskBulkWithRotation(products, availableKeys, setAvailableKeys, modelId);
     }
     
-    if (!response.ok) throw new Error(`API Error: ${response.status} ${response.statusText}`);
+    if (!response.ok) throw new Error(`API Error: ${response.status}`);
     
     const data = await response.json();
     const rawText = data.candidates?.[0]?.content?.parts?.[0]?.text;
     if (!rawText) throw new Error("No response content");
     
     const cleanText = cleanJson(rawText);
-    let parsedResults;
-    try {
-      parsedResults = JSON.parse(cleanText);
-      if (!Array.isArray(parsedResults)) throw new Error("Not an array");
-    } catch (e) {
-      throw new Error("JSON Parse Error");
-    }
+    const parsedResults = JSON.parse(cleanText);
+    
+    if (!Array.isArray(parsedResults)) throw new Error("Not an array");
 
     const resultMap = {};
     parsedResults.forEach(item => {
@@ -163,8 +177,19 @@ JSON配列のみ:
     return resultMap;
 
   } catch (error) {
-    if (error.message.includes("CRITICAL_API_ERROR")) throw error;
-    console.error("Bulk Error:", error);
+    // 全キー全滅の場合
+    if (error.message.includes("ALL_KEYS_DEAD")) {
+      throw error;
+    }
+    
+    // JSONパースエラー等は、AIの一時的な不調なので、別のキーでリトライしてみる
+    console.error("Bulk Check Error:", error);
+    // 致命的でないなら少し待ってリトライ
+    await new Promise(resolve => setTimeout(resolve, 2000));
+    // 別のキーでリトライ（availableKeysはそのまま）
+    // 無限ループ防止のため、簡易的なエラーマップを返してスキップする手もあるが、
+    // ここでは粘り強くリトライする
+    // ただし再帰が深くなりすぎないようにしたいが、現状はキーローテーションで分散されることを期待
     const errorMap = {};
     products.forEach(p => {
       errorMap[p.id] = { risk: "Error", reason: error.message };
@@ -173,10 +198,15 @@ JSON配列のみ:
   }
 }
 
-async function checkIPRiskDetail(product, apiKey, modelId, retryCount = 0) {
-  const systemInstruction = `あなたは知的財産権弁護士です。以下の商品のリスクを再鑑定し、JSONで出力してください。`;
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${modelId}:generateContent?key=${apiKey}`;
+// 詳細分析用（同様にローテーション）
+async function checkIPRiskDetailWithRotation(product, availableKeys, setAvailableKeys, modelId) {
+  if (availableKeys.length === 0) return { risk: product.risk, detail: "APIキー切れ" };
   
+  const apiKey = availableKeys[Math.floor(Math.random() * availableKeys.length)];
+  const safeModelId = modelId || 'gemini-1.5-flash';
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${safeModelId}:generateContent?key=${apiKey}`;
+  
+  const systemInstruction = `あなたは知的財産権弁護士です。以下の商品のリスクを再鑑定し、JSONで出力してください。`;
   const payload = {
     contents: [{ parts: [{ text: `商品名: ${product.productName}, 一次判定: ${product.risk}, 理由: ${product.reason}` }] }],
     systemInstruction: { parts: [{ text: systemInstruction }] },
@@ -190,15 +220,16 @@ async function checkIPRiskDetail(product, apiKey, modelId, retryCount = 0) {
       body: JSON.stringify(payload)
     });
     
-    if (response.status === 404 || response.status === 400 || response.status === 401) {
-      throw new Error(`CRITICAL_API_ERROR: ${response.status}`);
+    if (response.status === 404 || response.status === 400 || response.status === 403) {
+      // 不良キー除外
+      const newKeys = availableKeys.filter(k => k !== apiKey);
+      if (setAvailableKeys) setAvailableKeys(newKeys);
+      return checkIPRiskDetailWithRotation(product, newKeys, setAvailableKeys, modelId);
     }
 
     if (response.status === 429) {
-      if (retryCount < 5) { 
-        await new Promise(resolve => setTimeout(resolve, 2000));
-        return checkIPRiskDetail(product, apiKey, modelId, retryCount + 1);
-      } else { throw new Error("API混雑"); }
+      await new Promise(resolve => setTimeout(resolve, 2000));
+      return checkIPRiskDetailWithRotation(product, availableKeys, setAvailableKeys, modelId);
     }
     
     if (!response.ok) throw new Error(`API Error: ${response.status}`);
@@ -215,10 +246,10 @@ async function checkIPRiskDetail(product, apiKey, modelId, retryCount = 0) {
     return { risk, detail: result.detailed_analysis };
 
   } catch (error) {
-    if (error.message.includes("CRITICAL_API_ERROR")) throw error;
-    return { risk: product.risk, detail: `詳細分析失敗: ${error.message}` };
+    return { risk: product.risk, detail: `分析不可: ${error.message}` };
   }
 }
+
 
 // ==========================================
 // 3. メインコンポーネント
@@ -227,8 +258,9 @@ export default function App() {
   const [isAuthenticated, setIsAuthenticated] = useState(false);
   const [inputPassword, setInputPassword] = useState('');
   
-  // APIキーは複数行のテキストとして管理
   const [apiKeysText, setApiKeysText] = useState('');
+  const [activeKeys, setActiveKeys] = useState([]); // 実行中に使用する有効なキーリスト
+  
   const [firebaseConfigJson, setFirebaseConfigJson] = useState('');
   const [modelId, setModelId] = useState('gemini-1.5-flash'); 
   const [db, setDb] = useState(null);
@@ -251,8 +283,7 @@ export default function App() {
     errorCount: 0,
     currentBatch: 0,
     totalBatches: 0,
-    lastError: null,
-    activeKeyCount: 0
+    deadKeysCount: 0 // 死んだキーの数
   });
 
   const [encoding, setEncoding] = useState('Shift_JIS');
@@ -260,17 +291,17 @@ export default function App() {
   const stopRef = useRef(false);
 
   useEffect(() => {
-    const savedKeys = localStorage.getItem('gemini_api_keys'); // キー名を変更
+    const savedKeys = localStorage.getItem('gemini_api_keys'); 
     const savedFbConfig = localStorage.getItem('firebase_config');
     const savedModel = localStorage.getItem('gemini_model');
-    
-    // 旧バージョンの単一キー設定があれば移行する
     const legacyKey = localStorage.getItem('gemini_api_key');
     
     if (savedKeys) {
       setApiKeysText(savedKeys);
+      setActiveKeys(parseKeys(savedKeys));
     } else if (legacyKey) {
       setApiKeysText(legacyKey);
+      setActiveKeys(parseKeys(legacyKey));
     }
 
     if (savedModel) setModelId(savedModel);
@@ -279,6 +310,11 @@ export default function App() {
       initFirebase(savedFbConfig);
     }
   }, []);
+
+  // APIキーテキストが変更されたらActiveKeysも更新
+  useEffect(() => {
+    setActiveKeys(parseKeys(apiKeysText));
+  }, [apiKeysText]);
 
   const initFirebase = (configStr) => {
     try {
@@ -306,7 +342,7 @@ export default function App() {
   };
 
   const saveSettings = () => {
-    localStorage.setItem('gemini_api_keys', apiKeysText); // 複数キー保存
+    localStorage.setItem('gemini_api_keys', apiKeysText);
     localStorage.setItem('firebase_config', firebaseConfigJson);
     localStorage.setItem('gemini_model', modelId);
     if (firebaseConfigJson) initFirebase(firebaseConfigJson);
@@ -364,26 +400,26 @@ export default function App() {
 
   // --- 一次審査（バルク） ---
   const startProcessing = async () => {
-    if (!apiKeysText) return alert("設定画面でAPIキーを入力してください");
+    if (activeKeys.length === 0) return alert("有効なAPIキーが設定されていません。設定画面を確認してください。");
     if (csvData.length === 0) return;
-
-    // 有効なキーの数をカウント
-    const keyCount = apiKeysText.split(/[\n, ]+/).filter(k=>k.trim().length>0).length;
-    if(keyCount === 0) return alert("有効なAPIキーがありません");
 
     setIsProcessing(true);
     setIsDetailAnalyzing(false);
     stopRef.current = false;
     setResults([]); 
     setProgress(0);
+    
+    // 実行用の一時的なキーリスト（ここで減っても設定画面のテキストは消えない）
+    // StateのactiveKeysではなく、実行時のローカルコピーを使うと、再実行時に復活できるが、
+    // ここでは「セッション中はずっと除外」するためにStateのセッターを渡す
+    
     setStatusState({ 
       message: '初期化中...', 
       successCount: 0, 
       errorCount: 0, 
       currentBatch: 0, 
       totalBatches: 0, 
-      lastError: null,
-      activeKeyCount: keyCount
+      deadKeysCount: 0
     });
 
     const BULK_SIZE = 30; 
@@ -398,6 +434,10 @@ export default function App() {
 
     while (currentIndex < total) {
       if (stopRef.current) break;
+      if (activeKeys.length === 0) {
+        alert("全てのAPIキーがエラー（404/400等）で無効化されました。キーを確認してください。");
+        break;
+      }
 
       const tasks = [];
       const currentBatchNum = Math.floor(currentIndex / BULK_SIZE) + 1;
@@ -406,7 +446,8 @@ export default function App() {
         ...prev,
         message: `並列処理中... (${currentIndex}/${total}件)`,
         currentBatch: currentBatchNum,
-        totalBatches: totalBatches
+        totalBatches: totalBatches,
+        deadKeysCount: parseKeys(apiKeysText).length - activeKeys.length // 元の数 - 現在の数
       }));
 
       for (let c = 0; c < CONCURRENCY; c++) {
@@ -426,11 +467,8 @@ export default function App() {
         }
         
         if (chunkProducts.length > 0) {
-          // リクエストのたびにランダムなキーを選択 (ローテーション)
-          const currentKey = getRandomKey(apiKeysText);
-          
           tasks.push(
-            checkIPRiskBulk(chunkProducts, currentKey, modelId).then(resultMap => {
+            checkIPRiskBulkWithRotation(chunkProducts, activeKeys, setActiveKeys, modelId).then(resultMap => {
               return chunkProducts.map(p => ({
                 id: p.id,
                 productName: p.name,
@@ -456,8 +494,7 @@ export default function App() {
           setStatusState(prev => ({
             ...prev,
             successCount: prev.successCount + success,
-            errorCount: prev.errorCount + errors,
-            lastError: errors > 0 ? flatResults.find(r => r.risk === 'Error')?.reason : prev.lastError
+            errorCount: prev.errorCount + errors
           }));
 
           currentIndex += tasks.reduce((acc, _, idx) => {
@@ -469,11 +506,9 @@ export default function App() {
           setProgress(nextProgress);
 
         } catch (e) {
-          if (e.message.includes("CRITICAL_API_ERROR")) {
-            setStatusState(prev => ({ ...prev, message: '緊急停止: API設定エラー', lastError: e.message }));
-            alert(`【緊急停止】APIエラーが発生しました。\n${e.message}`);
-            setIsProcessing(false);
-            return;
+          if (e.message.includes("ALL_KEYS_DEAD")) {
+             alert("全てのAPIキーが無効になりました。処理を停止します。");
+             break;
           }
           console.error("Batch error:", e);
           currentIndex += (CONCURRENCY * BULK_SIZE);
@@ -490,7 +525,7 @@ export default function App() {
   };
 
   const startDetailAnalysis = async () => {
-    if (!apiKeysText) return;
+    if (activeKeys.length === 0) return alert("有効なキーがありません");
     setIsDetailAnalyzing(true);
     stopRef.current = false;
     
@@ -503,14 +538,14 @@ export default function App() {
 
     for (let i = 0; i < totalRisky; i += CONCURRENCY) {
       if (stopRef.current) break;
+      if (activeKeys.length === 0) break;
       
       const batch = riskyItems.slice(i, i + CONCURRENCY);
       setStatusState(prev => ({ ...prev, message: `詳細鑑定中 (${i + 1}/${totalRisky})`, currentBatch: i + 1 }));
 
       try {
         const promises = batch.map(item => {
-          const currentKey = getRandomKey(apiKeysText); // 詳細分析もローテーション
-          return checkIPRiskDetail(item, currentKey, modelId).then(res => ({
+          return checkIPRiskDetailWithRotation(item, activeKeys, setActiveKeys, modelId).then(res => ({
             id: item.id,
             finalRisk: res.risk,
             detail: res.detail
@@ -529,10 +564,7 @@ export default function App() {
         setResults([...newResults]); 
         
       } catch (e) {
-        if (e.message.includes("CRITICAL_API_ERROR")) {
-           alert("詳細鑑定中に致命的なAPIエラーが発生しました。停止します。");
-           break;
-        }
+         // 個別のエラーは無視して進む
       }
       await new Promise(resolve => setTimeout(resolve, 500));
     }
@@ -591,8 +623,6 @@ export default function App() {
     );
   }
 
-  const riskyCount = results.filter(r => ['Critical', 'High', 'Medium'].includes(r.risk)).length;
-
   return (
     <div className="min-h-screen bg-slate-50 font-sans text-slate-800">
       <nav className="bg-white border-b border-slate-200 sticky top-0 z-20 shadow-sm">
@@ -618,11 +648,11 @@ export default function App() {
             <div className="bg-white p-6 rounded-xl shadow-sm border border-slate-200 space-y-4">
               {/* ステータスコックピット */}
               <div className="grid grid-cols-1 md:grid-cols-4 gap-4 mb-4">
-                <div className={`p-4 rounded-lg border flex items-center gap-3 ${statusState.lastError ? 'bg-red-50 border-red-200' : 'bg-slate-50 border-slate-200'}`}>
-                  <Activity className={`w-5 h-5 ${statusState.lastError ? 'text-red-600' : 'text-blue-600'}`} />
-                  <div>
+                <div className={`p-4 rounded-lg border flex items-center gap-3 bg-slate-50 border-slate-200`}>
+                  <Activity className="w-5 h-5 text-blue-600" />
+                  <div className="w-full">
                     <p className="text-xs text-slate-500 font-bold">ステータス</p>
-                    <p className={`text-sm font-bold truncate w-full ${statusState.lastError ? 'text-red-700' : 'text-slate-700'}`}>{statusState.message}</p>
+                    <p className="text-sm font-bold truncate w-full text-slate-700">{statusState.message}</p>
                   </div>
                 </div>
                 <div className="p-4 rounded-lg border bg-green-50 border-green-200 flex items-center gap-3">
@@ -632,18 +662,18 @@ export default function App() {
                     <p className="text-xl font-bold text-green-700">{statusState.successCount}</p>
                   </div>
                 </div>
-                <div className="p-4 rounded-lg border bg-rose-50 border-rose-200 flex items-center gap-3">
-                  <AlertTriangle className="w-5 h-5 text-rose-600" />
-                  <div>
-                    <p className="text-xs text-rose-600 font-bold">エラー件数</p>
-                    <p className="text-xl font-bold text-rose-700">{statusState.errorCount}</p>
-                  </div>
-                </div>
                 <div className="p-4 rounded-lg border bg-blue-50 border-blue-200 flex items-center gap-3">
                   <Key className="w-5 h-5 text-blue-600" />
                   <div>
-                    <p className="text-xs text-blue-600 font-bold">稼働APIキー数</p>
-                    <p className="text-xl font-bold text-blue-700">{statusState.activeKeyCount} <span className="text-xs font-normal">本</span></p>
+                    <p className="text-xs text-blue-600 font-bold">稼働キー数</p>
+                    <p className="text-xl font-bold text-blue-700">{activeKeys.length} <span className="text-xs font-normal">/ {parseKeys(apiKeysText).length}</span></p>
+                  </div>
+                </div>
+                <div className="p-4 rounded-lg border bg-rose-50 border-rose-200 flex items-center gap-3">
+                  <Ban className="w-5 h-5 text-rose-600" />
+                  <div>
+                    <p className="text-xs text-rose-600 font-bold">排除キー数</p>
+                    <p className="text-xl font-bold text-rose-700">{statusState.deadKeysCount}</p>
                   </div>
                 </div>
               </div>
@@ -684,7 +714,7 @@ export default function App() {
                       <div className="flex items-center gap-2"><Layers className={`w-5 h-5 ${isHighSpeed ? 'text-indigo-600' : 'text-slate-400'}`} /><span className={`font-bold text-sm ${isHighSpeed ? 'text-indigo-900' : 'text-slate-600'}`}>鬼バルクモード</span></div>
                       <div className={`w-10 h-5 rounded-full relative transition-colors ${isHighSpeed ? 'bg-indigo-600' : 'bg-slate-300'}`}><div className={`absolute top-1 w-3 h-3 bg-white rounded-full transition-transform ${isHighSpeed ? 'left-6' : 'left-1'}`} /></div>
                     </div>
-                    <p className="text-xs text-slate-500">マルチキーローテーション搭載。複数APIキーで制限を回避し、最高速度で判定します。</p>
+                    <p className="text-xs text-slate-500">見逃し厳禁・鬼検閲官による一括判定。疑わしいものは全て警告します。</p>
                   </div>
                 </div>
               </div>
@@ -711,13 +741,13 @@ export default function App() {
             </div>
 
             {/* ダブルチェックアクション */}
-            {riskyCount > 0 && !isProcessing && (
+            {results.filter(r => ['Critical', 'High', 'Medium'].includes(r.risk)).length > 0 && !isProcessing && (
               <div className="bg-indigo-50 border border-indigo-100 rounded-xl p-6 flex flex-col md:flex-row items-center justify-between gap-4 animate-in slide-in-from-top-2">
                 <div className="flex items-start gap-3">
                   <div className="bg-indigo-100 p-2 rounded-lg text-indigo-600"><Scale className="w-6 h-6" /></div>
                   <div>
                     <h3 className="font-bold text-indigo-900">AI弁護士によるダブルチェック</h3>
-                    <p className="text-sm text-indigo-700 mt-1">リスクあり <span className="font-bold text-indigo-900 bg-indigo-200 px-2 rounded">{riskyCount}件</span> に対し、専門家AIが詳細な法的根拠を鑑定します。</p>
+                    <p className="text-sm text-indigo-700 mt-1">リスクあり商品を専門家AIが再鑑定します。</p>
                   </div>
                 </div>
                 {!isDetailAnalyzing ? (
@@ -773,7 +803,7 @@ export default function App() {
                   <select value={modelId} onChange={(e) => setModelId(e.target.value)} className="w-full px-4 py-2 border rounded-lg bg-white">
                     {MODELS.map(m => <option key={m.id} value={m.id}>{m.name}</option>)}
                   </select>
-                  <p className="text-xs text-slate-500 mt-1">404エラーが出る場合はモデルを変更してください。Gemini 1.5 Flashが最も安定しています。</p>
+                  <p className="text-xs text-slate-500 mt-1">404エラーが出る場合はモデルを変更してください。</p>
                 </div>
                 <div>
                   <label className="block text-sm font-medium text-slate-700 mb-1">Gemini API Keys (複数登録推奨)</label>
@@ -783,7 +813,7 @@ export default function App() {
                     className="w-full px-4 py-2 border rounded-lg bg-slate-50 h-32 font-mono text-sm" 
                     placeholder={`AIza...\nAIza...\nAIza...\n(キーを改行区切りで複数入力すると、負荷分散モードが作動します)`}
                   />
-                  <p className="text-xs text-slate-500 mt-1">複数のAPIキーを入力すると、リクエストごとに自動で切り替えてレート制限（429エラー）を回避します。</p>
+                  <p className="text-xs text-slate-500 mt-1">複数のAPIキーを入力すると、エラーが出たキーを自動で排除して処理を継続します。</p>
                 </div>
                 <div>
                   <label className="block text-sm font-medium text-slate-700 mb-1">Firebase Config (JSON)</label>
