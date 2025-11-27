@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { Upload, FileText, CheckCircle, Play, Download, Loader2, ShieldAlert, Pause, Trash2, Eye, Zap, FolderOpen, Lock, LogOut, History, Settings, Save, AlertTriangle, RefreshCw, Layers, Siren, Scale, SearchCheck, Activity } from 'lucide-react';
+import { Upload, FileText, CheckCircle, Play, Download, Loader2, ShieldAlert, Pause, Trash2, Eye, Zap, FolderOpen, Lock, LogOut, History, Settings, Save, AlertTriangle, RefreshCw, Layers, Siren, Scale, SearchCheck, Activity, Cpu, Key } from 'lucide-react';
 import { initializeApp } from 'firebase/app';
 import { getFirestore, collection, addDoc, query, orderBy, limit, onSnapshot, serverTimestamp } from 'firebase/firestore';
 
@@ -10,12 +10,20 @@ const FIXED_PASSWORD = 'admin123';
 
 // リスク表示用の変換マップ
 const RISK_MAP = {
-  'Critical': { label: '危険', color: 'bg-rose-100 text-rose-800 border-rose-200 ring-1 ring-rose-300' }, // モラル・安全性
-  'High': { label: '高', color: 'bg-red-100 text-red-800 border-red-200' },     // 知財・薬機法（重）
-  'Medium': { label: '中', color: 'bg-yellow-100 text-yellow-800 border-yellow-200' }, // 疑わしい・薬機法（軽）
+  'Critical': { label: '危険', color: 'bg-rose-100 text-rose-800 border-rose-200 ring-1 ring-rose-300' }, 
+  'High': { label: '高', color: 'bg-red-100 text-red-800 border-red-200' },     
+  'Medium': { label: '中', color: 'bg-yellow-100 text-yellow-800 border-yellow-200' }, 
   'Low': { label: '低', color: 'bg-green-100 text-green-800 border-green-200' },
   'Error': { label: 'エラー', color: 'bg-gray-200 text-gray-800 border-gray-300' }
 };
+
+// 利用可能なモデル一覧
+const MODELS = [
+  { id: 'gemini-1.5-flash', name: 'Gemini 1.5 Flash (推奨・高速)' },
+  { id: 'gemini-1.5-flash-8b', name: 'Gemini 1.5 Flash-8B (超高速・軽量)' },
+  { id: 'gemini-1.5-pro', name: 'Gemini 1.5 Pro (高精度・低速)' },
+  { id: 'gemini-2.0-flash-exp', name: 'Gemini 2.0 Flash Exp (実験的・最新)' },
+];
 
 // ==========================================
 // 1. ユーティリティ関数
@@ -53,61 +61,52 @@ const readFileAsText = (file, encoding) => {
   });
 };
 
-// AIのレスポンスからJSON部分だけを抽出するクリーニング関数
 const cleanJson = (text) => {
   try {
-    let cleaned = text.replace(/```json/g, '').replace(/```/g, '');
-    cleaned = cleaned.trim();
+    let cleaned = text.replace(/```json/g, '').replace(/```/g, '').trim();
     const start = cleaned.indexOf('[');
     const end = cleaned.lastIndexOf(']');
-    if (start !== -1 && end !== -1) {
-      return cleaned.substring(start, end + 1);
-    }
-    // オブジェクト単体の場合の対応
+    if (start !== -1 && end !== -1) return cleaned.substring(start, end + 1);
     const startObj = cleaned.indexOf('{');
     const endObj = cleaned.lastIndexOf('}');
-    if (startObj !== -1 && endObj !== -1) {
-      return cleaned.substring(startObj, endObj + 1);
-    }
+    if (startObj !== -1 && endObj !== -1) return cleaned.substring(startObj, endObj + 1);
     return cleaned;
-  } catch (e) {
-    return text;
-  }
+  } catch (e) { return text; }
+};
+
+// 複数のキーからランダムに1つ選ぶ関数
+const getRandomKey = (keysText) => {
+  if (!keysText) return '';
+  // 改行、カンマ、スペースで区切って配列化し、空文字を除去
+  const keys = keysText.split(/[\n, ]+/).map(k => k.trim()).filter(k => k.length > 0);
+  if (keys.length === 0) return '';
+  const randomIndex = Math.floor(Math.random() * keys.length);
+  return keys[randomIndex];
 };
 
 // ==========================================
 // 2. API呼び出し関数
 // ==========================================
 
-/**
- * 1. 一次審査: バルク処理
- * 安定版モデル(gemini-1.5-flash)を使用し、エラー時は即座にスキップして次へ進む
- */
-async function checkIPRiskBulk(products, apiKey, retryCount = 0) {
+async function checkIPRiskBulk(products, apiKey, modelId, retryCount = 0) {
   const productsListText = products.map(p => `ID:${p.id} 商品名:${p.name}`).join('\n');
-
   const systemInstruction = `
 あなたはECモールの「知的財産権・薬機法・安全管理」の【鬼検閲官】です。
 入力された商品リストを審査し、リスク判定を行ってください。
+見逃し厳禁です。
 
 【判定ロジック】
-1. **🚨 Critical (危険/禁止)**: 銃器・武器類似品、アダルト、違法物。
-2. **🔴 High (高リスク)**: 偽ブランド、著作権侵害、薬機法（断定表現）。
-3. **🟡 Medium (中リスク)**: 互換品、景表法（最大級表現）、化粧品（逸脱）。
-4. **🟢 Low (低リスク)**: 一般名詞のみで安全なもの。
-
-**見逃し厳禁**です。少しでも疑わしければ Medium 以上にしてください。
+1. **🚨 Critical (危険)**: 銃器・武器類似品、アダルト、違法物。
+2. **🔴 High (高)**: 偽ブランド、著作権侵害、薬機法（断定表現）。
+3. **🟡 Medium (中)**: 互換品、景表法（最大級表現）、化粧品（逸脱）。
+4. **🟢 Low (低)**: 安全な一般名詞。
 
 【出力形式】
-JSON配列のみを出力してください。
-[
-  {"id": 入力ID, "risk_level": "Critical/High/Medium/Low", "reason": "短い理由"},
-  ...
-]
+JSON配列のみ:
+[{"id": ID, "risk_level": "Critical/High/Medium/Low", "reason": "短い理由"}, ...]
 `;
 
-  // 安定版モデルを使用
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${apiKey}`;
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${modelId}:generateContent?key=${apiKey}`;
   
   const payload = {
     contents: [{ parts: [{ text: `以下の商品を一括判定せよ:\n${productsListText}` }] }],
@@ -122,11 +121,16 @@ JSON配列のみを出力してください。
       body: JSON.stringify(payload)
     });
     
+    // 致命的なエラー(404:モデルなし, 400:不正リクエスト, 401:認証)はリトライせず即死させる
+    if (response.status === 404 || response.status === 400 || response.status === 401 || response.status === 403) {
+      throw new Error(`CRITICAL_API_ERROR: ${response.status} ${response.statusText}`);
+    }
+
     if (response.status === 429) {
-      if (retryCount < 5) { // リトライ回数を減らしてスタックを防ぐ
+      if (retryCount < 5) { 
         const waitTime = Math.pow(2, retryCount) * 1000 + Math.random() * 1000;
         await new Promise(resolve => setTimeout(resolve, waitTime));
-        return checkIPRiskBulk(products, apiKey, retryCount + 1);
+        return checkIPRiskBulk(products, apiKey, modelId, retryCount + 1);
       } else { 
         throw new Error("APIレート制限(429) - 混雑中"); 
       }
@@ -154,15 +158,13 @@ JSON配列のみを出力してください。
       else if (['高', 'High'].includes(risk)) risk = 'High';
       else if (['中', 'Medium'].includes(risk)) risk = 'Medium';
       else risk = 'Low';
-      
       resultMap[item.id] = { risk, reason: item.reason };
     });
-    
     return resultMap;
 
   } catch (error) {
+    if (error.message.includes("CRITICAL_API_ERROR")) throw error;
     console.error("Bulk Error:", error);
-    // エラー時はリトライせず、エラーマップを返して処理を止めない
     const errorMap = {};
     products.forEach(p => {
       errorMap[p.id] = { risk: "Error", reason: error.message };
@@ -171,28 +173,12 @@ JSON配列のみを出力してください。
   }
 }
 
-/**
- * 2. 二次審査: 詳細処理
- * 安定版モデル(gemini-1.5-flash)を使用
- */
-async function checkIPRiskDetail(product, apiKey, retryCount = 0) {
-  const systemInstruction = `
-あなたは知的財産権・薬機法・景品表示法に精通した弁護士です。
-以下の商品のリスク判定（一次審査結果）に対し、法的観点から詳細なセカンドオピニオンを提供してください。
-
-商品名: ${product.productName}
-一次判定: ${product.risk}
-理由: ${product.reason}
-
-【出力形式】
-JSONのみ:
-{ "final_risk": "Critical/High/Medium/Low", "detailed_analysis": "200文字程度の解説" }
-`;
-
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${apiKey}`;
+async function checkIPRiskDetail(product, apiKey, modelId, retryCount = 0) {
+  const systemInstruction = `あなたは知的財産権弁護士です。以下の商品のリスクを再鑑定し、JSONで出力してください。`;
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${modelId}:generateContent?key=${apiKey}`;
   
   const payload = {
-    contents: [{ parts: [{ text: `詳細鑑定をお願いします。` }] }],
+    contents: [{ parts: [{ text: `商品名: ${product.productName}, 一次判定: ${product.risk}, 理由: ${product.reason}` }] }],
     systemInstruction: { parts: [{ text: systemInstruction }] },
     generationConfig: { responseMimeType: "application/json" }
   };
@@ -204,18 +190,21 @@ JSONのみ:
       body: JSON.stringify(payload)
     });
     
+    if (response.status === 404 || response.status === 400 || response.status === 401) {
+      throw new Error(`CRITICAL_API_ERROR: ${response.status}`);
+    }
+
     if (response.status === 429) {
       if (retryCount < 5) { 
         await new Promise(resolve => setTimeout(resolve, 2000));
-        return checkIPRiskDetail(product, apiKey, retryCount + 1);
+        return checkIPRiskDetail(product, apiKey, modelId, retryCount + 1);
       } else { throw new Error("API混雑"); }
     }
     
     if (!response.ok) throw new Error(`API Error: ${response.status}`);
     const data = await response.json();
     const rawText = data.candidates?.[0]?.content?.parts?.[0]?.text;
-    const cleanText = cleanJson(rawText);
-    const result = JSON.parse(cleanText);
+    const result = JSON.parse(cleanJson(rawText));
     
     let risk = result.final_risk;
     if (['危険', 'Critical'].includes(risk)) risk = 'Critical';
@@ -226,6 +215,7 @@ JSONのみ:
     return { risk, detail: result.detailed_analysis };
 
   } catch (error) {
+    if (error.message.includes("CRITICAL_API_ERROR")) throw error;
     return { risk: product.risk, detail: `詳細分析失敗: ${error.message}` };
   }
 }
@@ -237,8 +227,10 @@ export default function App() {
   const [isAuthenticated, setIsAuthenticated] = useState(false);
   const [inputPassword, setInputPassword] = useState('');
   
-  const [apiKey, setApiKey] = useState('');
+  // APIキーは複数行のテキストとして管理
+  const [apiKeysText, setApiKeysText] = useState('');
   const [firebaseConfigJson, setFirebaseConfigJson] = useState('');
+  const [modelId, setModelId] = useState('gemini-1.5-flash'); 
   const [db, setDb] = useState(null);
   
   const [activeTab, setActiveTab] = useState('checker');
@@ -246,22 +238,42 @@ export default function App() {
   const [csvData, setCsvData] = useState([]);
   const [headers, setHeaders] = useState([]);
   const [targetColIndex, setTargetColIndex] = useState(-1);
+  
   const [results, setResults] = useState([]);
   const [historyData, setHistoryData] = useState([]);
   const [isProcessing, setIsProcessing] = useState(false);
   const [isDetailAnalyzing, setIsDetailAnalyzing] = useState(false);
   const [progress, setProgress] = useState(0);
-  const [statusMessage, setStatusMessage] = useState('');
+  
+  const [statusState, setStatusState] = useState({
+    message: '待機中',
+    successCount: 0,
+    errorCount: 0,
+    currentBatch: 0,
+    totalBatches: 0,
+    lastError: null,
+    activeKeyCount: 0
+  });
+
   const [encoding, setEncoding] = useState('Shift_JIS');
-  
   const [isHighSpeed, setIsHighSpeed] = useState(true); 
-  
   const stopRef = useRef(false);
 
   useEffect(() => {
-    const savedKey = localStorage.getItem('gemini_api_key');
+    const savedKeys = localStorage.getItem('gemini_api_keys'); // キー名を変更
     const savedFbConfig = localStorage.getItem('firebase_config');
-    if (savedKey) setApiKey(savedKey);
+    const savedModel = localStorage.getItem('gemini_model');
+    
+    // 旧バージョンの単一キー設定があれば移行する
+    const legacyKey = localStorage.getItem('gemini_api_key');
+    
+    if (savedKeys) {
+      setApiKeysText(savedKeys);
+    } else if (legacyKey) {
+      setApiKeysText(legacyKey);
+    }
+
+    if (savedModel) setModelId(savedModel);
     if (savedFbConfig) {
       setFirebaseConfigJson(savedFbConfig);
       initFirebase(savedFbConfig);
@@ -274,7 +286,6 @@ export default function App() {
       const app = initializeApp(config);
       const firestore = getFirestore(app);
       setDb(firestore);
-      
       const q = query(collection(firestore, 'ip_checks'), orderBy('createdAt', 'desc'), limit(50));
       onSnapshot(q, (snapshot) => {
         const docs = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
@@ -295,8 +306,9 @@ export default function App() {
   };
 
   const saveSettings = () => {
-    localStorage.setItem('gemini_api_key', apiKey);
+    localStorage.setItem('gemini_api_keys', apiKeysText); // 複数キー保存
     localStorage.setItem('firebase_config', firebaseConfigJson);
+    localStorage.setItem('gemini_model', modelId);
     if (firebaseConfigJson) initFirebase(firebaseConfigJson);
     alert("設定を保存しました");
   };
@@ -336,52 +348,70 @@ export default function App() {
         if (parsed.length > 0) {
           const fileHeaders = parsed[0];
           const fileRows = parsed.slice(1);
-          
           if (headers.length === 0 && i === 0) {
             commonHeaders = [...fileHeaders, "元ファイル名"];
             setHeaders(commonHeaders);
-            const nameIndex = fileHeaders.findIndex(h => 
-              h.includes('商品名') || h.includes('Name') || h.includes('Product') || h.includes('名称')
-            );
+            const nameIndex = fileHeaders.findIndex(h => h.includes('商品名') || h.includes('Name') || h.includes('Product') || h.includes('名称'));
             setTargetColIndex(nameIndex !== -1 ? nameIndex : 0);
           }
-          
           const rowsWithFileName = fileRows.map(row => [...row, file.name]); 
           newRows = [...newRows, ...rowsWithFileName];
         }
-      } catch (err) { 
-        alert(`${file.name} の読み込みに失敗しました。エンコードを確認してください。`); 
-      }
+      } catch (err) { alert(`${file.name} の読み込みに失敗しました。エンコードを確認してください。`); }
     }
     setCsvData(prev => [...prev, ...newRows]);
   };
 
+  // --- 一次審査（バルク） ---
   const startProcessing = async () => {
-    if (!apiKey) return alert("設定画面でAPIキーを入力してください");
+    if (!apiKeysText) return alert("設定画面でAPIキーを入力してください");
     if (csvData.length === 0) return;
+
+    // 有効なキーの数をカウント
+    const keyCount = apiKeysText.split(/[\n, ]+/).filter(k=>k.trim().length>0).length;
+    if(keyCount === 0) return alert("有効なAPIキーがありません");
 
     setIsProcessing(true);
     setIsDetailAnalyzing(false);
     stopRef.current = false;
     setResults([]); 
     setProgress(0);
-    setStatusMessage('処理を開始します...');
+    setStatusState({ 
+      message: '初期化中...', 
+      successCount: 0, 
+      errorCount: 0, 
+      currentBatch: 0, 
+      totalBatches: 0, 
+      lastError: null,
+      activeKeyCount: keyCount
+    });
 
     const BULK_SIZE = 30; 
     const CONCURRENCY = isHighSpeed ? 3 : 2;
 
     let currentIndex = 0;
     const total = csvData.length;
+    const totalBatches = Math.ceil(total / BULK_SIZE);
+
+    const initialJitter = Math.random() * 2000;
+    await new Promise(resolve => setTimeout(resolve, initialJitter));
 
     while (currentIndex < total) {
       if (stopRef.current) break;
 
       const tasks = [];
+      const currentBatchNum = Math.floor(currentIndex / BULK_SIZE) + 1;
       
+      setStatusState(prev => ({
+        ...prev,
+        message: `並列処理中... (${currentIndex}/${total}件)`,
+        currentBatch: currentBatchNum,
+        totalBatches: totalBatches
+      }));
+
       for (let c = 0; c < CONCURRENCY; c++) {
         const chunkStart = currentIndex + (c * BULK_SIZE);
         if (chunkStart >= total) break;
-        
         const chunkEnd = Math.min(chunkStart + BULK_SIZE, total);
         
         const chunkProducts = [];
@@ -396,8 +426,11 @@ export default function App() {
         }
         
         if (chunkProducts.length > 0) {
+          // リクエストのたびにランダムなキーを選択 (ローテーション)
+          const currentKey = getRandomKey(apiKeysText);
+          
           tasks.push(
-            checkIPRiskBulk(chunkProducts, apiKey).then(resultMap => {
+            checkIPRiskBulk(chunkProducts, currentKey, modelId).then(resultMap => {
               return chunkProducts.map(p => ({
                 id: p.id,
                 productName: p.name,
@@ -411,14 +444,22 @@ export default function App() {
         }
       }
 
-      setStatusMessage(`現在 ${currentIndex + 1} 〜 ${Math.min(currentIndex + (CONCURRENCY * BULK_SIZE), total)} 件目を並列処理中...`);
-
       if (tasks.length > 0) {
         try {
           const chunkResults = await Promise.all(tasks);
           const flatResults = chunkResults.flat();
-          setResults(prev => [...prev, ...flatResults]);
           
+          const success = flatResults.filter(r => r.risk !== 'Error').length;
+          const errors = flatResults.filter(r => r.risk === 'Error').length;
+          
+          setResults(prev => [...prev, ...flatResults]);
+          setStatusState(prev => ({
+            ...prev,
+            successCount: prev.successCount + success,
+            errorCount: prev.errorCount + errors,
+            lastError: errors > 0 ? flatResults.find(r => r.risk === 'Error')?.reason : prev.lastError
+          }));
+
           currentIndex += tasks.reduce((acc, _, idx) => {
              const processedInTask = Math.min(currentIndex + ((idx + 1) * BULK_SIZE), total) - (currentIndex + (idx * BULK_SIZE));
              return acc + (processedInTask > 0 ? processedInTask : 0);
@@ -426,82 +467,84 @@ export default function App() {
           
           const nextProgress = Math.round((currentIndex / total) * 100);
           setProgress(nextProgress);
+
         } catch (e) {
-          console.error("Batch processing error:", e);
-          // エラーがあってもループを抜けない（indexだけ無理やり進める）
+          if (e.message.includes("CRITICAL_API_ERROR")) {
+            setStatusState(prev => ({ ...prev, message: '緊急停止: API設定エラー', lastError: e.message }));
+            alert(`【緊急停止】APIエラーが発生しました。\n${e.message}`);
+            setIsProcessing(false);
+            return;
+          }
+          console.error("Batch error:", e);
           currentIndex += (CONCURRENCY * BULK_SIZE);
         }
       }
 
-      const baseWait = isHighSpeed ? 200 : 1500;
-      if (currentIndex < total) {
-        await new Promise(resolve => setTimeout(resolve, baseWait));
-      }
+      const baseWait = isHighSpeed ? 300 : 1500;
+      if (currentIndex < total) await new Promise(resolve => setTimeout(resolve, baseWait));
     }
     
     setProgress(100);
-    setStatusMessage('一次審査完了。');
+    setStatusState(prev => ({ ...prev, message: '一次審査完了' }));
     setIsProcessing(false);
   };
 
   const startDetailAnalysis = async () => {
-    if (!apiKey) return;
+    if (!apiKeysText) return;
     setIsDetailAnalyzing(true);
     stopRef.current = false;
-    setStatusMessage('詳細鑑定を開始します...');
-
+    
     const riskyItems = results.filter(r => ['Critical', 'High', 'Medium'].includes(r.risk));
     const totalRisky = riskyItems.length;
-    
     let newResults = [...results];
     const CONCURRENCY = 5;
     
+    setStatusState(prev => ({ ...prev, message: '詳細鑑定を開始します...', totalBatches: totalRisky, currentBatch: 0 }));
+
     for (let i = 0; i < totalRisky; i += CONCURRENCY) {
       if (stopRef.current) break;
       
       const batch = riskyItems.slice(i, i + CONCURRENCY);
-      setStatusMessage(`詳細鑑定中: ${i + 1} / ${totalRisky} 件...`);
+      setStatusState(prev => ({ ...prev, message: `詳細鑑定中 (${i + 1}/${totalRisky})`, currentBatch: i + 1 }));
 
-      const promises = batch.map(item => checkIPRiskDetail(item, apiKey).then(res => ({
-        id: item.id,
-        finalRisk: res.risk,
-        detail: res.detail
-      })));
+      try {
+        const promises = batch.map(item => {
+          const currentKey = getRandomKey(apiKeysText); // 詳細分析もローテーション
+          return checkIPRiskDetail(item, currentKey, modelId).then(res => ({
+            id: item.id,
+            finalRisk: res.risk,
+            detail: res.detail
+          }));
+        });
 
-      const batchResults = await Promise.all(promises);
+        const batchResults = await Promise.all(promises);
 
-      batchResults.forEach(res => {
-        const index = newResults.findIndex(r => r.id === res.id);
-        if (index !== -1) {
-          newResults[index] = {
-            ...newResults[index],
-            risk: res.finalRisk, 
-            detailedReason: res.detail,
-            isDetailed: true
-          };
-          saveToHistory(newResults[index]);
+        batchResults.forEach(res => {
+          const index = newResults.findIndex(r => r.id === res.id);
+          if (index !== -1) {
+            newResults[index] = { ...newResults[index], risk: res.finalRisk, detailedReason: res.detail, isDetailed: true };
+            saveToHistory(newResults[index]);
+          }
+        });
+        setResults([...newResults]); 
+        
+      } catch (e) {
+        if (e.message.includes("CRITICAL_API_ERROR")) {
+           alert("詳細鑑定中に致命的なAPIエラーが発生しました。停止します。");
+           break;
         }
-      });
-      
-      setResults([...newResults]); 
+      }
       await new Promise(resolve => setTimeout(resolve, 500));
     }
-
-    setStatusMessage('すべての処理が完了しました。');
     setIsDetailAnalyzing(false);
+    setStatusState(prev => ({ ...prev, message: '全工程完了' }));
   };
 
   const downloadCSV = (dataToDownload, filterRisky = false) => {
     const bom = new Uint8Array([0xEF, 0xBB, 0xBF]);
     let csvContent = "商品名,リスク判定,理由,詳細分析(AI弁護士),元ファイル名,判定日時\n";
-    
-    const data = filterRisky 
-      ? dataToDownload.filter(r => r.risk !== 'Low' && r.risk !== 'Error') 
-      : dataToDownload;
-
-    if (data.length === 0) {
-      return alert("該当するデータがありません");
-    }
+    const data = filterRisky ? dataToDownload.filter(r => r.risk !== 'Low' && r.risk !== 'Error') : dataToDownload;
+    if (data.length === 0) return alert("該当するデータがありません");
 
     data.forEach(r => {
       const riskLabel = RISK_MAP[r.risk]?.label || r.risk;
@@ -510,29 +553,20 @@ export default function App() {
       const detail = `"${(r.detailedReason || '').replace(/"/g, '""')}"`;
       const file = `"${(r.sourceFile || '').replace(/"/g, '""')}"`;
       const date = r.createdAt ? new Date(r.createdAt.seconds * 1000).toLocaleString() : new Date().toLocaleString();
-      
       csvContent += `${name},${riskLabel},${reason},${detail},${file},${date}\n`;
     });
-    
     const blob = new Blob([bom, csvContent], { type: "text/csv;charset=utf-8;" });
     const url = URL.createObjectURL(blob);
     const link = document.createElement("a");
     link.href = url;
-    const prefix = filterRisky ? "risky_detailed" : "all";
-    link.setAttribute("download", `ip_check_${prefix}_${new Date().getTime()}.csv`);
+    link.setAttribute("download", `ip_check_result.csv`);
     document.body.appendChild(link);
-    link.click(); 
-    document.body.removeChild(link);
+    link.click(); document.body.removeChild(link);
   };
 
   const RiskBadge = ({ risk }) => {
     const config = RISK_MAP[risk] || RISK_MAP['Error'];
-    return (
-      <span className={`px-3 py-1 rounded-full text-xs font-bold border whitespace-nowrap ${config.color}`}>
-        {risk === 'Critical' && <Siren className="w-3 h-3 inline mr-1 mb-0.5" />}
-        {config.label}
-      </span>
-    );
+    return <span className={`px-3 py-1 rounded-full text-xs font-bold border whitespace-nowrap ${config.color}`}>{risk === 'Critical' && <Siren className="w-3 h-3 inline mr-1 mb-0.5" />}{config.label}</span>;
   };
 
   if (!isAuthenticated) {
@@ -540,41 +574,24 @@ export default function App() {
       <div className="min-h-screen bg-slate-100 flex items-center justify-center p-4">
         <div className="bg-white p-16 rounded-2xl shadow-2xl w-full max-w-5xl transition-all border border-slate-200">
           <div className="flex flex-col items-center">
-            <div className="bg-blue-50 p-6 rounded-full mb-8">
-              <Lock className="w-16 h-16 text-blue-600" />
-            </div>
+            <div className="bg-blue-50 p-6 rounded-full mb-8"><Lock className="w-16 h-16 text-blue-600" /></div>
             <h1 className="text-4xl font-extrabold text-center text-slate-800 mb-3 tracking-tight">IP Patrol Pro</h1>
             <span className="text-sm font-bold bg-indigo-100 text-indigo-700 px-4 py-1.5 rounded-full mb-10">鬼バルクモード搭載</span>
           </div>
-          
           <form onSubmit={handleLogin} className="space-y-8 max-w-xl mx-auto"> 
             <div>
               <label className="block text-sm font-bold text-slate-600 mb-2">パスワード</label>
-              <input 
-                type="password" 
-                value={inputPassword} 
-                onChange={(e) => setInputPassword(e.target.value)}
-                className="w-full px-6 py-4 border border-slate-300 rounded-xl focus:ring-4 focus:ring-blue-100 focus:border-blue-500 outline-none transition-all text-lg"
-                placeholder="パスワードを入力"
-                autoFocus
-              />
+              <input type="password" value={inputPassword} onChange={(e) => setInputPassword(e.target.value)} className="w-full px-6 py-4 border border-slate-300 rounded-xl focus:ring-4 focus:ring-blue-100 focus:border-blue-500 outline-none transition-all text-lg" placeholder="パスワードを入力" autoFocus />
             </div>
-            <button type="submit" className="w-full bg-blue-600 text-white py-4 rounded-xl font-bold text-xl hover:bg-blue-700 shadow-xl shadow-blue-200 transition-all active:scale-95">
-              ログインして開始
-            </button>
+            <button type="submit" className="w-full bg-blue-600 text-white py-4 rounded-xl font-bold text-xl hover:bg-blue-700 shadow-xl shadow-blue-200 transition-all active:scale-95">ログインして開始</button>
           </form>
-          
-          <p className="text-center text-xs text-slate-400 mt-12 font-mono">
-            Authorized Personnel Only
-          </p>
+          <p className="text-center text-xs text-slate-400 mt-12 font-mono">Authorized Personnel Only</p>
         </div>
       </div>
     );
   }
 
-  // 危険なアイテムの数
   const riskyCount = results.filter(r => ['Critical', 'High', 'Medium'].includes(r.risk)).length;
-  const analyzedCount = results.filter(r => r.isDetailed).length;
 
   return (
     <div className="min-h-screen bg-slate-50 font-sans text-slate-800">
@@ -586,11 +603,7 @@ export default function App() {
           </div>
           <div className="flex items-center gap-1">
             {['checker', 'history', 'settings'].map(tab => (
-              <button 
-                key={tab}
-                onClick={() => setActiveTab(tab)} 
-                className={`px-4 py-2 rounded-lg text-sm font-medium transition-colors ${activeTab === tab ? 'bg-blue-50 text-blue-600' : 'text-slate-500 hover:bg-slate-50'}`}
-              >
+              <button key={tab} onClick={() => setActiveTab(tab)} className={`px-4 py-2 rounded-lg text-sm font-medium transition-colors ${activeTab === tab ? 'bg-blue-50 text-blue-600' : 'text-slate-500 hover:bg-slate-50'}`}>
                 {tab === 'checker' ? 'チェック' : tab === 'history' ? '履歴' : '設定'}
               </button>
             ))}
@@ -603,37 +616,51 @@ export default function App() {
         {activeTab === 'checker' && (
           <div className="space-y-6 animate-in fade-in duration-300">
             <div className="bg-white p-6 rounded-xl shadow-sm border border-slate-200 space-y-4">
+              {/* ステータスコックピット */}
+              <div className="grid grid-cols-1 md:grid-cols-4 gap-4 mb-4">
+                <div className={`p-4 rounded-lg border flex items-center gap-3 ${statusState.lastError ? 'bg-red-50 border-red-200' : 'bg-slate-50 border-slate-200'}`}>
+                  <Activity className={`w-5 h-5 ${statusState.lastError ? 'text-red-600' : 'text-blue-600'}`} />
+                  <div>
+                    <p className="text-xs text-slate-500 font-bold">ステータス</p>
+                    <p className={`text-sm font-bold truncate w-full ${statusState.lastError ? 'text-red-700' : 'text-slate-700'}`}>{statusState.message}</p>
+                  </div>
+                </div>
+                <div className="p-4 rounded-lg border bg-green-50 border-green-200 flex items-center gap-3">
+                  <CheckCircle className="w-5 h-5 text-green-600" />
+                  <div>
+                    <p className="text-xs text-green-600 font-bold">成功件数</p>
+                    <p className="text-xl font-bold text-green-700">{statusState.successCount}</p>
+                  </div>
+                </div>
+                <div className="p-4 rounded-lg border bg-rose-50 border-rose-200 flex items-center gap-3">
+                  <AlertTriangle className="w-5 h-5 text-rose-600" />
+                  <div>
+                    <p className="text-xs text-rose-600 font-bold">エラー件数</p>
+                    <p className="text-xl font-bold text-rose-700">{statusState.errorCount}</p>
+                  </div>
+                </div>
+                <div className="p-4 rounded-lg border bg-blue-50 border-blue-200 flex items-center gap-3">
+                  <Key className="w-5 h-5 text-blue-600" />
+                  <div>
+                    <p className="text-xs text-blue-600 font-bold">稼働APIキー数</p>
+                    <p className="text-xl font-bold text-blue-700">{statusState.activeKeyCount} <span className="text-xs font-normal">本</span></p>
+                  </div>
+                </div>
+              </div>
+
+              {/* ファイルアップロード */}
               <div className="flex flex-col lg:flex-row gap-6">
                 <div className="flex-1">
                   <div className="border-2 border-dashed border-slate-300 rounded-xl p-8 text-center hover:bg-blue-50 transition-colors relative cursor-pointer min-h-[160px] flex flex-col items-center justify-center group">
-                    <input 
-                      type="file" 
-                      accept=".csv" 
-                      multiple 
-                      onChange={handleFileUpload} 
-                      className="absolute inset-0 w-full h-full opacity-0 cursor-pointer z-10" 
-                    />
+                    <input type="file" accept=".csv" multiple onChange={handleFileUpload} className="absolute inset-0 w-full h-full opacity-0 cursor-pointer z-10" />
                     <FolderOpen className="w-10 h-10 text-slate-400 mb-3 group-hover:text-blue-500 transition-colors" />
                     <p className="text-base font-bold text-slate-700">CSVファイルをここにドロップ（複数可）</p>
                     <p className="text-xs text-slate-500 mt-1">またはクリックしてファイルを選択</p>
                   </div>
-                  
                   {files.length > 0 && (
-                    <div className="mt-4 bg-slate-50 rounded-lg p-3 border border-slate-100">
-                      <div className="flex justify-between items-center mb-2">
-                        <span className="text-xs font-bold text-slate-600">読み込み済みファイル ({files.length})</span>
-                        <button onClick={() => {setFiles([]); setCsvData([]); setResults([]);}} className="text-xs text-red-500 hover:text-red-700 flex items-center gap-1"><Trash2 className="w-3 h-3" /> 全削除</button>
-                      </div>
-                      <div className="max-h-24 overflow-y-auto space-y-1">
-                        {files.map((f, i) => (
-                          <div key={i} className="text-xs text-slate-500 flex items-center gap-2">
-                            <FileText className="w-3 h-3" /> {f.name}
-                          </div>
-                        ))}
-                      </div>
-                      <div className="mt-2 pt-2 border-t border-slate-200 text-right">
-                        <span className="text-sm font-bold text-blue-700">合計 {csvData.length} 件</span>
-                      </div>
+                    <div className="mt-4 bg-slate-50 rounded-lg p-3 border border-slate-100 flex justify-between items-center">
+                      <span className="text-xs font-bold text-slate-600">読み込み済み: {files.length}ファイル ({csvData.length}件)</span>
+                      <button onClick={() => {setFiles([]); setCsvData([]); setResults([]);}} className="text-xs text-red-500 hover:text-red-700 flex items-center gap-1"><Trash2 className="w-3 h-3" /> 全削除</button>
                     </div>
                   )}
                 </div>
@@ -642,39 +669,22 @@ export default function App() {
                   <div className="bg-slate-50 p-4 rounded-lg border border-slate-200">
                     <h3 className="text-sm font-bold text-slate-700 mb-3 flex items-center gap-2"><Settings className="w-4 h-4" /> 読込オプション</h3>
                     <div className="space-y-3">
-                      <div>
-                        <label className="block text-xs text-slate-500 mb-1">文字コード</label>
-                        <select value={encoding} onChange={(e) => setEncoding(e.target.value)} className="w-full px-3 py-2 border rounded bg-white text-sm">
-                          <option value="Shift_JIS">Shift_JIS (楽天/Excel)</option>
-                          <option value="UTF-8">UTF-8 (一般/Web)</option>
-                        </select>
-                      </div>
-                      <div>
-                        <label className="block text-xs text-slate-500 mb-1">チェック対象カラム</label>
-                        <select value={targetColIndex} onChange={(e) => setTargetColIndex(Number(e.target.value))} className="w-full px-3 py-2 border rounded bg-white text-sm" disabled={headers.length === 0}>
-                          {headers.length === 0 && <option>ファイルを読み込んでください</option>}
-                          {headers.map((h, i) => <option key={i} value={i}>{h}</option>)}
-                        </select>
-                      </div>
+                      <select value={encoding} onChange={(e) => setEncoding(e.target.value)} className="w-full px-3 py-2 border rounded bg-white text-sm">
+                        <option value="Shift_JIS">Shift_JIS (楽天/Excel)</option>
+                        <option value="UTF-8">UTF-8 (一般/Web)</option>
+                      </select>
+                      <select value={targetColIndex} onChange={(e) => setTargetColIndex(Number(e.target.value))} className="w-full px-3 py-2 border rounded bg-white text-sm" disabled={headers.length === 0}>
+                        {headers.length === 0 && <option>ファイルを読み込んでください</option>}
+                        {headers.map((h, i) => <option key={i} value={i}>{h}</option>)}
+                      </select>
                     </div>
                   </div>
-
-                  <div 
-                    onClick={() => setIsHighSpeed(!isHighSpeed)}
-                    className={`p-4 rounded-lg border cursor-pointer transition-all ${isHighSpeed ? 'bg-indigo-50 border-indigo-200 ring-2 ring-indigo-100' : 'bg-white border-slate-200'}`}
-                  >
+                  <div onClick={() => setIsHighSpeed(!isHighSpeed)} className={`p-4 rounded-lg border cursor-pointer transition-all ${isHighSpeed ? 'bg-indigo-50 border-indigo-200 ring-2 ring-indigo-100' : 'bg-white border-slate-200'}`}>
                     <div className="flex items-center justify-between mb-2">
-                      <div className="flex items-center gap-2">
-                        <Layers className={`w-5 h-5 ${isHighSpeed ? 'text-indigo-600 fill-indigo-600' : 'text-slate-400'}`} />
-                        <span className={`font-bold text-sm ${isHighSpeed ? 'text-indigo-900' : 'text-slate-600'}`}>鬼バルクモード</span>
-                      </div>
-                      <div className={`w-10 h-5 rounded-full relative transition-colors ${isHighSpeed ? 'bg-indigo-600' : 'bg-slate-300'}`}>
-                        <div className={`absolute top-1 w-3 h-3 bg-white rounded-full transition-transform ${isHighSpeed ? 'left-6' : 'left-1'}`} />
-                      </div>
+                      <div className="flex items-center gap-2"><Layers className={`w-5 h-5 ${isHighSpeed ? 'text-indigo-600' : 'text-slate-400'}`} /><span className={`font-bold text-sm ${isHighSpeed ? 'text-indigo-900' : 'text-slate-600'}`}>鬼バルクモード</span></div>
+                      <div className={`w-10 h-5 rounded-full relative transition-colors ${isHighSpeed ? 'bg-indigo-600' : 'bg-slate-300'}`}><div className={`absolute top-1 w-3 h-3 bg-white rounded-full transition-transform ${isHighSpeed ? 'left-6' : 'left-1'}`} /></div>
                     </div>
-                    <p className="text-xs text-slate-500">
-                      見逃し厳禁・鬼検閲官による一括判定。疑わしいものは全て警告します。
-                    </p>
+                    <p className="text-xs text-slate-500">マルチキーローテーション搭載。複数APIキーで制限を回避し、最高速度で判定します。</p>
                   </div>
                 </div>
               </div>
@@ -683,8 +693,8 @@ export default function App() {
                 <div className="flex items-center gap-4">
                   <div className="flex-1">
                     <div className="flex justify-between text-xs text-slate-500 mb-1">
-                      <span>{statusMessage || '一次審査進捗'}</span>
-                      <span>{progress}% ({results.length} / {csvData.length})</span>
+                      <span>{statusState.message}</span>
+                      <span>{progress}%</span>
                     </div>
                     <div className="bg-slate-100 rounded-full h-3 overflow-hidden">
                       <div className="h-full bg-gradient-to-r from-blue-500 to-indigo-600 transition-all duration-300" style={{ width: `${progress}%` }} />
@@ -692,53 +702,28 @@ export default function App() {
                   </div>
                   
                   {!isProcessing && !isDetailAnalyzing ? (
-                    <button 
-                      onClick={startProcessing} 
-                      disabled={files.length === 0} 
-                      className="flex items-center gap-2 px-8 py-3 bg-blue-600 hover:bg-blue-700 disabled:bg-slate-300 text-white font-bold rounded-lg shadow-md transition-transform active:scale-95"
-                    >
-                      <Play className="w-5 h-5" /> 一次審査開始
-                    </button>
+                    <button onClick={startProcessing} disabled={files.length === 0} className="flex items-center gap-2 px-8 py-3 bg-blue-600 hover:bg-blue-700 disabled:bg-slate-300 text-white font-bold rounded-lg shadow-md transition-transform active:scale-95"><Play className="w-5 h-5" /> 一次審査開始</button>
                   ) : (
-                    <button 
-                      onClick={() => {stopRef.current = true; setIsProcessing(false); setIsDetailAnalyzing(false); setStatusMessage('停止しました');}} 
-                      className="flex items-center gap-2 px-8 py-3 bg-amber-500 hover:bg-amber-600 text-white font-bold rounded-lg shadow-md transition-transform active:scale-95"
-                    >
-                      <Pause className="w-5 h-5" /> 一時停止
-                    </button>
+                    <button onClick={() => {stopRef.current = true; setIsProcessing(false); setIsDetailAnalyzing(false); setStatusState(p => ({...p, message: '停止しました'}));}} className="flex items-center gap-2 px-8 py-3 bg-amber-500 hover:bg-amber-600 text-white font-bold rounded-lg shadow-md transition-transform active:scale-95"><Pause className="w-5 h-5" /> 一時停止</button>
                   )}
                 </div>
               </div>
             </div>
 
-            {/* ダブルチェック（詳細分析）アクションエリア */}
+            {/* ダブルチェックアクション */}
             {riskyCount > 0 && !isProcessing && (
               <div className="bg-indigo-50 border border-indigo-100 rounded-xl p-6 flex flex-col md:flex-row items-center justify-between gap-4 animate-in slide-in-from-top-2">
                 <div className="flex items-start gap-3">
-                  <div className="bg-indigo-100 p-2 rounded-lg text-indigo-600">
-                    <Scale className="w-6 h-6" />
-                  </div>
+                  <div className="bg-indigo-100 p-2 rounded-lg text-indigo-600"><Scale className="w-6 h-6" /></div>
                   <div>
                     <h3 className="font-bold text-indigo-900">AI弁護士によるダブルチェック</h3>
-                    <p className="text-sm text-indigo-700 mt-1">
-                      一次審査で「リスクあり」とされた <span className="font-bold text-indigo-900 bg-indigo-200 px-2 rounded">{riskyCount}件</span> の商品に対し、専門家AIが1件ずつ詳細な法的根拠を鑑定します。
-                    </p>
-                    {isDetailAnalyzing && (
-                       <p className="text-xs font-mono text-indigo-500 mt-2">詳細分析中... {analyzedCount} / {riskyCount} 完了</p>
-                    )}
+                    <p className="text-sm text-indigo-700 mt-1">リスクあり <span className="font-bold text-indigo-900 bg-indigo-200 px-2 rounded">{riskyCount}件</span> に対し、専門家AIが詳細な法的根拠を鑑定します。</p>
                   </div>
                 </div>
                 {!isDetailAnalyzing ? (
-                  <button 
-                    onClick={startDetailAnalysis}
-                    className="flex items-center gap-2 px-6 py-3 bg-indigo-600 hover:bg-indigo-700 text-white font-bold rounded-lg shadow-lg shadow-indigo-200 transition-all active:scale-95 whitespace-nowrap"
-                  >
-                    <SearchCheck className="w-5 h-5" /> 詳細鑑定を実行
-                  </button>
+                  <button onClick={startDetailAnalysis} className="flex items-center gap-2 px-6 py-3 bg-indigo-600 hover:bg-indigo-700 text-white font-bold rounded-lg shadow-lg shadow-indigo-200 transition-all active:scale-95 whitespace-nowrap"><SearchCheck className="w-5 h-5" /> 詳細鑑定を実行</button>
                 ) : (
-                   <div className="flex items-center gap-2 text-indigo-600 font-bold px-4">
-                     <Loader2 className="w-5 h-5 animate-spin" /> 鑑定中...
-                   </div>
+                   <div className="flex items-center gap-2 text-indigo-600 font-bold px-4"><Loader2 className="w-5 h-5 animate-spin" /> 鑑定中...</div>
                 )}
               </div>
             )}
@@ -746,164 +731,64 @@ export default function App() {
             <div className="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden flex flex-col h-[600px]">
               <div className="p-4 border-b border-slate-100 flex justify-between items-center bg-slate-50 shrink-0">
                 <div className="flex items-center gap-3">
-                  <h2 className="font-bold text-slate-700 flex items-center gap-2"><CheckCircle className="w-5 h-5 text-green-600" /> 判定結果</h2>
-                  <span className="bg-slate-200 text-slate-600 px-2 py-0.5 rounded text-xs font-mono">{results.length} 件</span>
+                  <h2 className="font-bold text-slate-700 flex items-center gap-2"><CheckCircle className="w-5 h-5 text-green-600" /> 判定結果 ({results.length}件)</h2>
                 </div>
                 <div className="flex items-center gap-2">
-                  <button 
-                    onClick={() => downloadCSV(results, true)} 
-                    disabled={results.length === 0} 
-                    className="px-4 py-2 bg-red-50 border border-red-200 hover:bg-red-100 text-red-700 rounded-lg text-sm font-medium flex items-center gap-2 shadow-sm disabled:opacity-50 transition-colors"
-                  >
-                    <Download className="w-4 h-4" /> リスクありのみ保存
-                  </button>
-                  <button 
-                    onClick={() => downloadCSV(results, false)} 
-                    disabled={results.length === 0} 
-                    className="px-4 py-2 bg-white border border-slate-300 hover:bg-slate-50 text-slate-700 rounded-lg text-sm font-medium flex items-center gap-2 shadow-sm disabled:opacity-50"
-                  >
-                    <Download className="w-4 h-4" /> 全件保存
-                  </button>
+                  <button onClick={() => downloadCSV(results, true)} disabled={results.length === 0} className="px-4 py-2 bg-red-50 border border-red-200 hover:bg-red-100 text-red-700 rounded-lg text-sm font-medium flex items-center gap-2 shadow-sm disabled:opacity-50 transition-colors"><Download className="w-4 h-4" /> リスクありのみ保存</button>
+                  <button onClick={() => downloadCSV(results, false)} disabled={results.length === 0} className="px-4 py-2 bg-white border border-slate-300 hover:bg-slate-50 text-slate-700 rounded-lg text-sm font-medium flex items-center gap-2 shadow-sm disabled:opacity-50"><Download className="w-4 h-4" /> 全件保存</button>
                 </div>
               </div>
-              
               <div className="flex-1 overflow-auto">
                 <table className="w-full text-sm text-left">
                   <thead className="text-xs text-slate-500 uppercase bg-slate-50 sticky top-0 z-10 shadow-sm">
-                    <tr>
-                      <th className="px-4 py-3 w-28 text-center">判定</th>
-                      <th className="px-4 py-3 w-1/3">商品名</th>
-                      <th className="px-4 py-3">
-                        指摘理由・リスク要因
-                        <span className="block text-[10px] text-slate-400 font-normal">上段:一次審査 / 下段:詳細鑑定</span>
-                      </th>
-                      <th className="px-4 py-3 w-32">元ファイル</th>
-                    </tr>
+                    <tr><th className="px-4 py-3 w-28 text-center">判定</th><th className="px-4 py-3 w-1/3">商品名</th><th className="px-4 py-3">指摘理由・リスク要因</th><th className="px-4 py-3 w-32">元ファイル</th></tr>
                   </thead>
                   <tbody className="divide-y divide-slate-100">
                     {results.map((item, idx) => (
                       <tr key={idx} className={`hover:bg-slate-50 transition-colors ${item.risk === 'Critical' ? 'bg-rose-50' : ''}`}>
-                        <td className="px-4 py-3 text-center">
-                          <RiskBadge risk={item.risk} />
-                          {item.isDetailed && <div className="mt-1 text-[10px] text-indigo-600 font-bold border border-indigo-200 bg-indigo-50 rounded px-1">鑑定済</div>}
-                        </td>
+                        <td className="px-4 py-3 text-center"><RiskBadge risk={item.risk} />{item.isDetailed && <div className="mt-1 text-[10px] text-indigo-600 font-bold border border-indigo-200 bg-indigo-50 rounded px-1">鑑定済</div>}</td>
+                        <td className="px-4 py-3"><div className="font-medium text-slate-700 line-clamp-2" title={item.productName}>{item.productName}</div></td>
                         <td className="px-4 py-3">
-                          <div className="font-medium text-slate-700 line-clamp-2" title={item.productName}>
-                            {item.productName}
-                          </div>
+                          <div className={`text-xs mb-1 ${item.risk === 'Critical' ? 'text-rose-700 font-bold' : item.risk === 'High' ? 'text-red-600 font-bold' : 'text-slate-600'}`}>{item.reason}</div>
+                          {item.detailedReason && <div className="text-xs text-indigo-700 bg-indigo-50 p-2 rounded border border-indigo-100 mt-1"><span className="font-bold mr-1">【弁護士AI】</span>{item.detailedReason}</div>}
                         </td>
-                        <td className="px-4 py-3">
-                          <div className={`text-xs mb-1 ${item.risk === 'Critical' ? 'text-rose-700 font-bold' : item.risk === 'High' ? 'text-red-600 font-bold' : 'text-slate-600'}`}>
-                            {item.reason}
-                          </div>
-                          {item.detailedReason && (
-                            <div className="text-xs text-indigo-700 bg-indigo-50 p-2 rounded border border-indigo-100 mt-1">
-                              <span className="font-bold mr-1">【弁護士AI】</span>
-                              {item.detailedReason}
-                            </div>
-                          )}
-                        </td>
-                        <td className="px-4 py-3 text-xs text-slate-400 truncate max-w-[150px]" title={item.sourceFile}>
-                          {item.sourceFile}
-                        </td>
+                        <td className="px-4 py-3 text-xs text-slate-400 truncate max-w-[150px]" title={item.sourceFile}>{item.sourceFile}</td>
                       </tr>
                     ))}
-                    {results.length === 0 && (
-                      <tr>
-                        <td colSpan="4" className="px-4 py-12 text-center text-slate-400">
-                          データがありません。CSVをアップロードしてチェックを開始してください。
-                        </td>
-                      </tr>
-                    )}
                   </tbody>
                 </table>
               </div>
             </div>
-            
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-               <div className="bg-blue-50 border border-blue-100 rounded-lg p-4 text-xs text-blue-800 flex items-start gap-2">
-                <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5" />
-                <div>
-                  <p className="font-bold mb-1">健康食品・美容商材チェック</p>
-                  <p>「効果効能の断定」「身体的変化の保証」「最大級表現」など、薬機法・景表法抵触の恐れがある表現をチェックします。</p>
-                </div>
-              </div>
-              <div className="bg-rose-50 border border-rose-100 rounded-lg p-4 text-xs text-rose-800 flex items-start gap-2">
-                <Siren className="w-4 h-4 shrink-0 mt-0.5" />
-                <div>
-                  <p className="font-bold mb-1">危険・モラルチェック</p>
-                  <p>おもちゃの銃（武器類似）、公序良俗に反する商品、アダルト関連など、モラルや安全性に関わる商品を「危険」として検知します。</p>
-                </div>
-              </div>
-            </div>
           </div>
         )}
 
-        {/* ... (history, settings tabs are the same) ... */}
-        {activeTab === 'history' && (
-          <div className="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden animate-in fade-in">
-            <div className="p-6 border-b border-slate-100 flex justify-between items-center bg-slate-50">
-              <div>
-                <h2 className="text-lg font-bold text-slate-800 flex items-center gap-2"><History className="w-5 h-5 text-blue-600" /> チェック履歴 (最新50件)</h2>
-                <p className="text-xs text-slate-500 mt-1">「危険」「高」「中」の判定のみクラウドに保存されています。</p>
-              </div>
-              {!db && <span className="text-xs text-red-500 bg-red-50 px-2 py-1 rounded border border-red-100">※Firebase未設定</span>}
-            </div>
-            <div className="overflow-x-auto">
-              <table className="w-full text-sm text-left">
-                <thead className="text-xs text-slate-500 uppercase bg-slate-50">
-                  <tr>
-                    <th className="px-6 py-3">日時</th>
-                    <th className="px-6 py-3 text-center">判定</th>
-                    <th className="px-6 py-3">商品名</th>
-                    <th className="px-6 py-3">理由 (詳細分析含む)</th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-slate-100">
-                  {historyData.map((item) => (
-                    <tr key={item.id} className="hover:bg-slate-50">
-                      <td className="px-6 py-4 whitespace-nowrap text-slate-400 text-xs">
-                        {item.createdAt ? new Date(item.createdAt.seconds * 1000).toLocaleString() : '-'}
-                      </td>
-                      <td className="px-6 py-4 text-center"><RiskBadge risk={item.risk} /></td>
-                      <td className="px-6 py-4 font-medium text-slate-700 max-w-xs truncate">{item.productName}</td>
-                      <td className="px-6 py-4 text-slate-600 text-xs">{item.reason}</td>
-                    </tr>
-                  ))}
-                  {historyData.length === 0 && (
-                    <tr>
-                      <td colSpan="4" className="px-6 py-8 text-center text-slate-400">履歴がありません</td>
-                    </tr>
-                  )}
-                </tbody>
-              </table>
-            </div>
-          </div>
-        )}
-
+        {/* --- 設定画面 --- */}
         {activeTab === 'settings' && (
           <div className="max-w-2xl mx-auto space-y-6 animate-in fade-in">
             <div className="bg-white p-6 rounded-xl shadow-sm border border-slate-200">
               <h2 className="text-lg font-bold text-slate-800 mb-4 flex items-center gap-2"><Settings className="w-5 h-5" /> アプリ設定</h2>
-              
               <div className="space-y-4">
                 <div>
-                  <label className="block text-sm font-medium text-slate-700 mb-1">Gemini API Key</label>
-                  <input type="password" value={apiKey} onChange={(e) => setApiKey(e.target.value)} className="w-full px-4 py-2 border rounded-lg bg-slate-50" placeholder="AIza..." />
-                  <p className="text-xs text-slate-500 mt-1">Google AI Studioで取得したAPIキーを入力してください。</p>
+                  <label className="block text-sm font-medium text-slate-700 mb-1">使用するAIモデル</label>
+                  <select value={modelId} onChange={(e) => setModelId(e.target.value)} className="w-full px-4 py-2 border rounded-lg bg-white">
+                    {MODELS.map(m => <option key={m.id} value={m.id}>{m.name}</option>)}
+                  </select>
+                  <p className="text-xs text-slate-500 mt-1">404エラーが出る場合はモデルを変更してください。Gemini 1.5 Flashが最も安定しています。</p>
                 </div>
-
+                <div>
+                  <label className="block text-sm font-medium text-slate-700 mb-1">Gemini API Keys (複数登録推奨)</label>
+                  <textarea 
+                    value={apiKeysText} 
+                    onChange={(e) => setApiKeysText(e.target.value)} 
+                    className="w-full px-4 py-2 border rounded-lg bg-slate-50 h-32 font-mono text-sm" 
+                    placeholder={`AIza...\nAIza...\nAIza...\n(キーを改行区切りで複数入力すると、負荷分散モードが作動します)`}
+                  />
+                  <p className="text-xs text-slate-500 mt-1">複数のAPIキーを入力すると、リクエストごとに自動で切り替えてレート制限（429エラー）を回避します。</p>
+                </div>
                 <div>
                   <label className="block text-sm font-medium text-slate-700 mb-1">Firebase Config (JSON)</label>
-                  <textarea 
-                    value={firebaseConfigJson} 
-                    onChange={(e) => setFirebaseConfigJson(e.target.value)} 
-                    className="w-full px-4 py-2 border rounded-lg bg-slate-50 h-32 text-xs font-mono" 
-                    placeholder='{"apiKey": "...", "authDomain": "...", "projectId": "..."}' 
-                  />
-                  <p className="text-xs text-slate-500 mt-1">履歴を保存するにはFirebaseの構成オブジェクト（JSON）を貼り付けてください。</p>
+                  <textarea value={firebaseConfigJson} onChange={(e) => setFirebaseConfigJson(e.target.value)} className="w-full px-4 py-2 border rounded-lg bg-slate-50 h-32 text-xs font-mono" />
                 </div>
-
                 <div className="pt-4">
                   <button onClick={saveSettings} className="flex items-center justify-center gap-2 w-full bg-indigo-600 text-white font-bold py-2 rounded-lg hover:bg-indigo-700 shadow-sm"><Save className="w-4 h-4" /> 設定を保存</button>
                 </div>
