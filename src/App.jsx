@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { Upload, FileText, CheckCircle, Play, Download, Loader2, ShieldAlert, Pause, Trash2, Eye, Zap, FolderOpen, Lock, LogOut, History, Settings, Save, AlertTriangle, RefreshCw, Layers, Siren, Scale, SearchCheck } from 'lucide-react';
+import { Upload, FileText, CheckCircle, Play, Download, Loader2, ShieldAlert, Pause, Trash2, Eye, Zap, FolderOpen, Lock, LogOut, History, Settings, Save, AlertTriangle, RefreshCw, Layers, Siren, Scale, SearchCheck, Activity } from 'lucide-react';
 import { initializeApp } from 'firebase/app';
 import { getFirestore, collection, addDoc, query, orderBy, limit, onSnapshot, serverTimestamp } from 'firebase/firestore';
 
@@ -56,14 +56,18 @@ const readFileAsText = (file, encoding) => {
 // AIのレスポンスからJSON部分だけを抽出するクリーニング関数
 const cleanJson = (text) => {
   try {
-    // Markdownのコードブロック記号を削除
     let cleaned = text.replace(/```json/g, '').replace(/```/g, '');
     cleaned = cleaned.trim();
-    // 配列の開始と終了を探して抽出
     const start = cleaned.indexOf('[');
     const end = cleaned.lastIndexOf(']');
     if (start !== -1 && end !== -1) {
       return cleaned.substring(start, end + 1);
+    }
+    // オブジェクト単体の場合の対応
+    const startObj = cleaned.indexOf('{');
+    const endObj = cleaned.lastIndexOf('}');
+    if (startObj !== -1 && endObj !== -1) {
+      return cleaned.substring(startObj, endObj + 1);
     }
     return cleaned;
   } catch (e) {
@@ -76,167 +80,37 @@ const cleanJson = (text) => {
 // ==========================================
 
 /**
- * 1. 一次審査: 複数の商品を一度に判定するバルク処理
- * 「見逃し厳禁」モード + 堅牢なエラーハンドリング
+ * 1. 一次審査: バルク処理
+ * 安定版モデル(gemini-1.5-flash)を使用し、エラー時は即座にスキップして次へ進む
  */
 async function checkIPRiskBulk(products, apiKey, retryCount = 0) {
-  // 入力リストの作成
   const productsListText = products.map(p => `ID:${p.id} 商品名:${p.name}`).join('\n');
 
   const systemInstruction = `
 あなたはECモールの「知的財産権・薬機法・安全管理」の【鬼検閲官】です。
 入力された商品リストを審査し、リスク判定を行ってください。
 
-【最重要司令: 見逃しは許されない】
-あなたは「安全な商品を通過させる」ことではなく、**「少しでも怪しい商品を摘発する」**ことが仕事です。
-**「過剰検知（False Positive）」は許されますが、「見逃し（False Negative）」は一切許されません。**
-1%でも疑わしい要素があれば、躊躇なく **Medium** 以上をつけて警告してください。
+【判定ロジック】
+1. **🚨 Critical (危険/禁止)**: 銃器・武器類似品、アダルト、違法物。
+2. **🔴 High (高リスク)**: 偽ブランド、著作権侵害、薬機法（断定表現）。
+3. **🟡 Medium (中リスク)**: 互換品、景表法（最大級表現）、化粧品（逸脱）。
+4. **🟢 Low (低リスク)**: 一般名詞のみで安全なもの。
 
-【厳格な判定ロジック】
-
-1. **🚨 Critical (危険/禁止)**
-   - 銃器類（モデルガン、エアガン含む）、刀剣、ボウガン等の武器類似品。
-   - アダルト、性的な隠語、差別、暴力表現。
-   - 違法薬物、爆発物を示唆するもの。
-
-2. **🔴 High (高リスク: ほぼクロ)**
-   - **パロディ・模倣**: 「〇〇風」「〇〇タイプ」「〇〇調」「〇〇スタイル」という言葉があり、ブランド名やキャラ名が続く場合。
-   - **偽ブランド**: 有名ブランド名（Nike, Chanel, Disney, ポケモン等）があるが、「公式」「純正」「中古」等の正当性を示す言葉がない、または価格が安すぎることを示唆する文脈（激安、訳あり等）。
-   - **薬機法（断定）**: 「ガンが治る」「必ず痩せる」「育毛」「白髪が黒くなる」など、身体的変化・治療を断定する表現。
-
-3. **🟡 Medium (中リスク: 要目視確認)**
-   - **互換品の疑い**: 「〇〇対応」「for 〇〇」とあるが、純正品と誤認しやすい表記。
-   - **景品表示法（誇大）**: 「世界一」「最強」「No.1」「神効果」「激ヤセ」などの根拠なき強調。
-   - **化粧品・健康食品の暗示**: 「デトックス」「アンチエイジング」「若返り」「免疫力」「血液サラサラ」など、医薬品的な効果を暗示する表現。
-
-4. **🟢 Low (低リスク)**
-   - 上記のいずれにも該当せず、一般名詞のみで構成され、完全に安全であると断言できるもののみ。
-
-【思考プロセス】
-各商品に対し、まず「High」か「Medium」の理由を探してください。
-理由が全く見つからない場合のみ、「Low」としてください。
+**見逃し厳禁**です。少しでも疑わしければ Medium 以上にしてください。
 
 【出力形式】
-JSON配列のみを出力してください。Markdown記法は不要です。
+JSON配列のみを出力してください。
 [
-  {"id": 入力されたID, "risk_level": "Critical/High/Medium/Low", "reason": "短い日本語での指摘(なぜ疑ったか)"},
+  {"id": 入力ID, "risk_level": "Critical/High/Medium/Low", "reason": "短い理由"},
   ...
 ]
 `;
 
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-exp:generateContent?key=${apiKey}`;
+  // 安定版モデルを使用
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${apiKey}`;
   
   const payload = {
-    contents: [{ parts: [{ text: `以下の商品リストを【厳格に】一括判定せよ。迷ったらMediumにせよ。\n${productsListText}` }] }],
-    systemInstruction: { parts: [{ text: systemInstruction }] },
-    generationConfig: { 
-      responseMimeType: "application/json" 
-    }
-  };
-
-  try {
-    const response = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload)
-    });
-    
-    // レート制限 (429) 対応
-    if (response.status === 429) {
-      if (retryCount < 10) { 
-        // 指数バックオフ + ランダムゆらぎ
-        const baseWait = Math.pow(1.5, retryCount + 1) * 1000;
-        const jitter = Math.random() * 2000;
-        const waitTime = Math.min(baseWait + jitter, 30000); // 最大30秒待機
-
-        console.warn(`API制限検知。${Math.round(waitTime)}ms 待機後にリトライします (${retryCount + 1}/10)`);
-        await new Promise(resolve => setTimeout(resolve, waitTime));
-        return checkIPRiskBulk(products, apiKey, retryCount + 1);
-      } else { 
-        throw new Error("API混雑により判定できませんでした"); 
-      }
-    }
-    
-    if (!response.ok) throw new Error(`API Error: ${response.status}`);
-    
-    const data = await response.json();
-    const rawText = data.candidates?.[0]?.content?.parts?.[0]?.text;
-    if (!rawText) throw new Error("No response");
-    
-    // JSONクリーニングとパース
-    const cleanText = cleanJson(rawText);
-    let parsedResults;
-    try {
-      parsedResults = JSON.parse(cleanText);
-      if (!Array.isArray(parsedResults)) throw new Error("レスポンスが配列ではありません");
-    } catch (e) {
-      console.error("JSON Parse Error:", e, cleanText);
-      throw new Error("AIレスポンスの解析に失敗しました");
-    }
-
-    const resultMap = {};
-    parsedResults.forEach(item => {
-      let risk = item.risk_level;
-      // 表記ゆれ吸収
-      if (risk === '危険') risk = 'Critical';
-      if (risk === '高') risk = 'High';
-      if (risk === '中') risk = 'Medium';
-      if (risk === '低') risk = 'Low';
-      if (!risk) risk = 'Medium'; // デフォルトはMedium（安全側）
-      
-      resultMap[item.id] = { risk, reason: item.reason };
-    });
-    
-    return resultMap;
-
-  } catch (error) {
-    console.error("Bulk Check Error:", error);
-    // 致命的なエラーでもリトライ回数が残っていればリトライ
-    if (retryCount < 3 && !error.message.includes("429")) {
-        const waitTime = 2000 + Math.random() * 2000;
-        await new Promise(resolve => setTimeout(resolve, waitTime));
-        return checkIPRiskBulk(products, apiKey, retryCount + 1);
-    }
-    
-    // どうしてもダメな場合は、全件エラーとして返す（処理を止めないため）
-    const errorMap = {};
-    products.forEach(p => {
-      errorMap[p.id] = { risk: "Error", reason: `判定エラー: ${error.message}` };
-    });
-    return errorMap;
-  }
-}
-
-/**
- * 2. 二次審査: 個別の商品を深掘り判定する詳細処理
- */
-async function checkIPRiskDetail(product, apiKey, retryCount = 0) {
-  const systemInstruction = `
-あなたは知的財産権・薬機法・景品表示法に精通した【専門の弁護士】です。
-一次審査の検閲官が「リスクあり」と判定した以下の商品について、セカンドオピニオン（詳細鑑定）を提供してください。
-
-【商品情報】
-商品名: ${product.productName}
-一次判定: ${product.risk}
-一次理由: ${product.reason}
-
-【依頼内容】
-1. 一次判定が妥当かどうか、法的な観点（商標法、不正競争防止法、薬機法、景表法など）から厳密に検証してください。
-2. もし一次判定が「過剰反応（実は安全）」である場合は、理由を明確に添えて判定を「Low」に修正してください。
-3. リスクがある場合は、「なぜ違法性があるのか」「どの言葉がアウトなのか」を担当者が納得できるよう具体的に解説してください。
-
-【出力形式】
-JSONのみを出力してください。
-{
-  "final_risk": "Critical/High/Medium/Low",
-  "detailed_analysis": "専門家としての詳細な見解（200文字程度で具体的に）"
-}
-`;
-
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-exp:generateContent?key=${apiKey}`;
-  
-  const payload = {
-    contents: [{ parts: [{ text: `この商品のリスクを詳細に鑑定せよ。` }] }],
+    contents: [{ parts: [{ text: `以下の商品を一括判定せよ:\n${productsListText}` }] }],
     systemInstruction: { parts: [{ text: systemInstruction }] },
     generationConfig: { responseMimeType: "application/json" }
   };
@@ -249,25 +123,105 @@ JSONのみを出力してください。
     });
     
     if (response.status === 429) {
-      if (retryCount < 10) { 
-        const waitTime = Math.pow(1.5, retryCount + 1) * 2000 + Math.random() * 2000;
+      if (retryCount < 5) { // リトライ回数を減らしてスタックを防ぐ
+        const waitTime = Math.pow(2, retryCount) * 1000 + Math.random() * 1000;
         await new Promise(resolve => setTimeout(resolve, waitTime));
+        return checkIPRiskBulk(products, apiKey, retryCount + 1);
+      } else { 
+        throw new Error("APIレート制限(429) - 混雑中"); 
+      }
+    }
+    
+    if (!response.ok) throw new Error(`API Error: ${response.status} ${response.statusText}`);
+    
+    const data = await response.json();
+    const rawText = data.candidates?.[0]?.content?.parts?.[0]?.text;
+    if (!rawText) throw new Error("No response content");
+    
+    const cleanText = cleanJson(rawText);
+    let parsedResults;
+    try {
+      parsedResults = JSON.parse(cleanText);
+      if (!Array.isArray(parsedResults)) throw new Error("Not an array");
+    } catch (e) {
+      throw new Error("JSON Parse Error");
+    }
+
+    const resultMap = {};
+    parsedResults.forEach(item => {
+      let risk = item.risk_level;
+      if (['危険', 'Critical'].includes(risk)) risk = 'Critical';
+      else if (['高', 'High'].includes(risk)) risk = 'High';
+      else if (['中', 'Medium'].includes(risk)) risk = 'Medium';
+      else risk = 'Low';
+      
+      resultMap[item.id] = { risk, reason: item.reason };
+    });
+    
+    return resultMap;
+
+  } catch (error) {
+    console.error("Bulk Error:", error);
+    // エラー時はリトライせず、エラーマップを返して処理を止めない
+    const errorMap = {};
+    products.forEach(p => {
+      errorMap[p.id] = { risk: "Error", reason: error.message };
+    });
+    return errorMap;
+  }
+}
+
+/**
+ * 2. 二次審査: 詳細処理
+ * 安定版モデル(gemini-1.5-flash)を使用
+ */
+async function checkIPRiskDetail(product, apiKey, retryCount = 0) {
+  const systemInstruction = `
+あなたは知的財産権・薬機法・景品表示法に精通した弁護士です。
+以下の商品のリスク判定（一次審査結果）に対し、法的観点から詳細なセカンドオピニオンを提供してください。
+
+商品名: ${product.productName}
+一次判定: ${product.risk}
+理由: ${product.reason}
+
+【出力形式】
+JSONのみ:
+{ "final_risk": "Critical/High/Medium/Low", "detailed_analysis": "200文字程度の解説" }
+`;
+
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${apiKey}`;
+  
+  const payload = {
+    contents: [{ parts: [{ text: `詳細鑑定をお願いします。` }] }],
+    systemInstruction: { parts: [{ text: systemInstruction }] },
+    generationConfig: { responseMimeType: "application/json" }
+  };
+
+  try {
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    });
+    
+    if (response.status === 429) {
+      if (retryCount < 5) { 
+        await new Promise(resolve => setTimeout(resolve, 2000));
         return checkIPRiskDetail(product, apiKey, retryCount + 1);
       } else { throw new Error("API混雑"); }
     }
     
     if (!response.ok) throw new Error(`API Error: ${response.status}`);
-    
     const data = await response.json();
     const rawText = data.candidates?.[0]?.content?.parts?.[0]?.text;
     const cleanText = cleanJson(rawText);
     const result = JSON.parse(cleanText);
     
     let risk = result.final_risk;
-    if (risk === '危険') risk = 'Critical';
-    if (risk === '高') risk = 'High';
-    if (risk === '中') risk = 'Medium';
-    if (risk === '低') risk = 'Low';
+    if (['危険', 'Critical'].includes(risk)) risk = 'Critical';
+    else if (['高', 'High'].includes(risk)) risk = 'High';
+    else if (['中', 'Medium'].includes(risk)) risk = 'Medium';
+    else risk = 'Low';
 
     return { risk, detail: result.detailed_analysis };
 
@@ -297,9 +251,9 @@ export default function App() {
   const [isProcessing, setIsProcessing] = useState(false);
   const [isDetailAnalyzing, setIsDetailAnalyzing] = useState(false);
   const [progress, setProgress] = useState(0);
+  const [statusMessage, setStatusMessage] = useState('');
   const [encoding, setEncoding] = useState('Shift_JIS');
   
-  // デフォルトで高速モードON
   const [isHighSpeed, setIsHighSpeed] = useState(true); 
   
   const stopRef = useRef(false);
@@ -402,7 +356,6 @@ export default function App() {
     setCsvData(prev => [...prev, ...newRows]);
   };
 
-  // --- 一次審査（バルク） ---
   const startProcessing = async () => {
     if (!apiKey) return alert("設定画面でAPIキーを入力してください");
     if (csvData.length === 0) return;
@@ -411,19 +364,14 @@ export default function App() {
     setIsDetailAnalyzing(false);
     stopRef.current = false;
     setResults([]); 
+    setProgress(0);
+    setStatusMessage('処理を開始します...');
 
-    // === 鬼バルクモード設定（最適化済み） ===
-    // BULK_SIZE: 30件 (Gemini 2.0なら余裕で、かつ速度が出る)
     const BULK_SIZE = 30; 
-    // CONCURRENCY: 3並列 (多すぎると429エラーで逆に遅くなるため、3が黄金比)
     const CONCURRENCY = isHighSpeed ? 3 : 2;
 
     let currentIndex = 0;
     const total = csvData.length;
-
-    // 初動の分散（多重タブ対策）
-    const initialJitter = Math.random() * 2000;
-    await new Promise(resolve => setTimeout(resolve, initialJitter));
 
     while (currentIndex < total) {
       if (stopRef.current) break;
@@ -448,7 +396,6 @@ export default function App() {
         }
         
         if (chunkProducts.length > 0) {
-          // エラーが発生してもcatch内で処理され、必ず結果が返ってくるように設計
           tasks.push(
             checkIPRiskBulk(chunkProducts, apiKey).then(resultMap => {
               return chunkProducts.map(p => ({
@@ -464,53 +411,57 @@ export default function App() {
         }
       }
 
+      setStatusMessage(`現在 ${currentIndex + 1} 〜 ${Math.min(currentIndex + (CONCURRENCY * BULK_SIZE), total)} 件目を並列処理中...`);
+
       if (tasks.length > 0) {
-        // 並列処理の完了を待つ
-        const chunkResults = await Promise.all(tasks);
-        const flatResults = chunkResults.flat();
-        
-        // 結果を画面に追加
-        setResults(prev => [...prev, ...flatResults]);
-        
-        // 進捗を更新
-        const processedCount = flatResults.length;
-        currentIndex += processedCount; // 実際に処理した数だけ進める
-        
-        const nextProgress = Math.round((currentIndex / total) * 100);
-        setProgress(nextProgress);
+        try {
+          const chunkResults = await Promise.all(tasks);
+          const flatResults = chunkResults.flat();
+          setResults(prev => [...prev, ...flatResults]);
+          
+          currentIndex += tasks.reduce((acc, _, idx) => {
+             const processedInTask = Math.min(currentIndex + ((idx + 1) * BULK_SIZE), total) - (currentIndex + (idx * BULK_SIZE));
+             return acc + (processedInTask > 0 ? processedInTask : 0);
+          }, 0);
+          
+          const nextProgress = Math.round((currentIndex / total) * 100);
+          setProgress(nextProgress);
+        } catch (e) {
+          console.error("Batch processing error:", e);
+          // エラーがあってもループを抜けない（indexだけ無理やり進める）
+          currentIndex += (CONCURRENCY * BULK_SIZE);
+        }
       }
 
-      // 次のバッチへのインターバル（API制限回避）
-      const baseWait = isHighSpeed ? 300 : 1500;
-      const jitter = Math.random() * 500;
+      const baseWait = isHighSpeed ? 200 : 1500;
       if (currentIndex < total) {
-        await new Promise(resolve => setTimeout(resolve, baseWait + jitter));
+        await new Promise(resolve => setTimeout(resolve, baseWait));
       }
     }
     
     setProgress(100);
+    setStatusMessage('一次審査完了。');
     setIsProcessing(false);
   };
 
-  // --- 二次審査（詳細分析） ---
   const startDetailAnalysis = async () => {
     if (!apiKey) return;
     setIsDetailAnalyzing(true);
     stopRef.current = false;
+    setStatusMessage('詳細鑑定を開始します...');
 
     const riskyItems = results.filter(r => ['Critical', 'High', 'Medium'].includes(r.risk));
     const totalRisky = riskyItems.length;
     
     let newResults = [...results];
-    
     const CONCURRENCY = 5;
     
-    await new Promise(resolve => setTimeout(resolve, Math.random() * 2000));
-
     for (let i = 0; i < totalRisky; i += CONCURRENCY) {
       if (stopRef.current) break;
       
       const batch = riskyItems.slice(i, i + CONCURRENCY);
+      setStatusMessage(`詳細鑑定中: ${i + 1} / ${totalRisky} 件...`);
+
       const promises = batch.map(item => checkIPRiskDetail(item, apiKey).then(res => ({
         id: item.id,
         finalRisk: res.risk,
@@ -533,10 +484,10 @@ export default function App() {
       });
       
       setResults([...newResults]); 
-      
-      await new Promise(resolve => setTimeout(resolve, 500 + Math.random() * 500));
+      await new Promise(resolve => setTimeout(resolve, 500));
     }
 
+    setStatusMessage('すべての処理が完了しました。');
     setIsDetailAnalyzing(false);
   };
 
@@ -732,7 +683,7 @@ export default function App() {
                 <div className="flex items-center gap-4">
                   <div className="flex-1">
                     <div className="flex justify-between text-xs text-slate-500 mb-1">
-                      <span>一次審査進捗</span>
+                      <span>{statusMessage || '一次審査進捗'}</span>
                       <span>{progress}% ({results.length} / {csvData.length})</span>
                     </div>
                     <div className="bg-slate-100 rounded-full h-3 overflow-hidden">
@@ -750,7 +701,7 @@ export default function App() {
                     </button>
                   ) : (
                     <button 
-                      onClick={() => {stopRef.current = true; setIsProcessing(false); setIsDetailAnalyzing(false);}} 
+                      onClick={() => {stopRef.current = true; setIsProcessing(false); setIsDetailAnalyzing(false); setStatusMessage('停止しました');}} 
                       className="flex items-center gap-2 px-8 py-3 bg-amber-500 hover:bg-amber-600 text-white font-bold rounded-lg shadow-md transition-transform active:scale-95"
                     >
                       <Pause className="w-5 h-5" /> 一時停止
