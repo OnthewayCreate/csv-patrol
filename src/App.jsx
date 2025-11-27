@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { Upload, FileText, CheckCircle, Play, Download, Loader2, ShieldAlert, Pause, Trash2, Eye, Zap, FolderOpen, Lock, LogOut, History, Settings, Save, AlertTriangle, RefreshCw, Layers, Siren, Scale, SearchCheck, Activity, Cpu, Key, Ban, RotateCcw, Stethoscope, Check, X, Edit3 } from 'lucide-react';
+import { Upload, FileText, CheckCircle, Play, Download, Loader2, ShieldAlert, Pause, Trash2, Eye, Zap, FolderOpen, Lock, LogOut, History, Settings, Save, AlertTriangle, RefreshCw, Layers, Siren, Scale, SearchCheck, Activity, Cpu, Key, Ban, RotateCcw, Stethoscope, Check, X, Edit3, AlertOctagon } from 'lucide-react';
 import { initializeApp } from 'firebase/app';
 import { getFirestore, collection, addDoc, query, orderBy, limit, onSnapshot, serverTimestamp } from 'firebase/firestore';
 
@@ -16,9 +16,8 @@ const RISK_MAP = {
   'Error': { label: 'エラー', color: 'bg-gray-200 text-gray-800 border-gray-300' }
 };
 
-// 実績のあるモデルID一覧 (ダッシュボードの表示名とAPI IDは異なる場合があります)
 const MODELS = [
-  { id: 'gemini-1.5-flash', name: 'Gemini 1.5 Flash (推奨・最も安定)' },
+  { id: 'gemini-1.5-flash', name: 'Gemini 1.5 Flash (推奨・安定)' },
   { id: 'gemini-1.5-flash-001', name: 'Gemini 1.5 Flash-001 (安定版)' },
   { id: 'gemini-1.5-flash-002', name: 'Gemini 1.5 Flash-002 (最新安定版)' },
   { id: 'gemini-1.5-flash-8b', name: 'Gemini 1.5 Flash-8B (軽量高速)' },
@@ -27,7 +26,6 @@ const MODELS = [
   { id: 'gemini-2.5-flash', name: 'Gemini 2.5 Flash (ダッシュボード表示用)' }, 
 ];
 
-// デフォルトは最も確実な 1.5 Flash に戻します
 const DEFAULT_MODEL = 'gemini-1.5-flash';
 
 // ==========================================
@@ -129,7 +127,6 @@ JSON配列のみ:
       body: JSON.stringify(payload)
     });
     
-    // 404: モデルエラー -> デフォルトモデルでリトライ
     if (response.status === 404) {
       if (!isFallback && currentModelId !== DEFAULT_MODEL) {
         console.warn(`モデル(${currentModelId})404エラー。標準(${DEFAULT_MODEL})でリトライします。`);
@@ -144,7 +141,7 @@ JSON配列のみ:
       return checkIPRiskBulkWithRotation(products, newKeys, setAvailableKeys, currentModelId, isFallback);
     }
 
-    if (response.status === 429) {
+    if (response.status === 429 || response.status === 503) {
       const waitTime = 2000 + Math.random() * 3000;
       await new Promise(resolve => setTimeout(resolve, waitTime));
       return checkIPRiskBulkWithRotation(products, availableKeys, setAvailableKeys, currentModelId, isFallback);
@@ -183,62 +180,6 @@ JSON配列のみ:
   }
 }
 
-async function checkIPRiskDetailWithRotation(product, availableKeys, setAvailableKeys, modelId, isFallback = false) {
-  if (availableKeys.length === 0) return { risk: product.risk, detail: "APIキー切れ" };
-  
-  const apiKey = availableKeys[Math.floor(Math.random() * availableKeys.length)];
-  const currentModelId = isFallback ? DEFAULT_MODEL : (modelId || DEFAULT_MODEL);
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${currentModelId}:generateContent?key=${apiKey}`;
-  
-  const systemInstruction = `あなたは知的財産権弁護士です。以下の商品のリスクを再鑑定し、JSONで出力してください。`;
-  const payload = {
-    contents: [{ parts: [{ text: `商品名: ${product.productName}, 一次判定: ${product.risk}, 理由: ${product.reason}` }] }],
-    systemInstruction: { parts: [{ text: systemInstruction }] },
-    generationConfig: { responseMimeType: "application/json" }
-  };
-
-  try {
-    const response = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload)
-    });
-    
-    if (response.status === 404) {
-       if (!isFallback && currentModelId !== DEFAULT_MODEL) {
-         return checkIPRiskDetailWithRotation(product, availableKeys, setAvailableKeys, DEFAULT_MODEL, true);
-       }
-    }
-
-    if (response.status === 404 || response.status === 400 || response.status === 403) {
-      const newKeys = availableKeys.filter(k => k !== apiKey);
-      if (setAvailableKeys) setAvailableKeys(newKeys);
-      return checkIPRiskDetailWithRotation(product, newKeys, setAvailableKeys, currentModelId, isFallback);
-    }
-
-    if (response.status === 429) {
-      await new Promise(resolve => setTimeout(resolve, 2000));
-      return checkIPRiskDetailWithRotation(product, availableKeys, setAvailableKeys, currentModelId, isFallback);
-    }
-    
-    if (!response.ok) throw new Error(`API Error: ${response.status}`);
-    const data = await response.json();
-    const rawText = data.candidates?.[0]?.content?.parts?.[0]?.text;
-    const result = JSON.parse(cleanJson(rawText));
-    
-    let risk = result.final_risk;
-    if (['危険', 'Critical'].includes(risk)) risk = 'Critical';
-    else if (['高', 'High'].includes(risk)) risk = 'High';
-    else if (['中', 'Medium'].includes(risk)) risk = 'Medium';
-    else risk = 'Low';
-
-    return { risk, detail: result.detailed_analysis };
-
-  } catch (error) {
-    return { risk: product.risk, detail: `分析不可: ${error.message}` };
-  }
-}
-
 // ==========================================
 // 3. メインコンポーネント
 // ==========================================
@@ -252,7 +193,7 @@ export default function App() {
   
   const [firebaseConfigJson, setFirebaseConfigJson] = useState('');
   const [modelId, setModelId] = useState(DEFAULT_MODEL);
-  const [customModelId, setCustomModelId] = useState(''); // カスタムモデル入力用
+  const [customModelId, setCustomModelId] = useState(''); 
   const [db, setDb] = useState(null);
   
   const [activeTab, setActiveTab] = useState('checker');
@@ -264,7 +205,6 @@ export default function App() {
   const [results, setResults] = useState([]);
   const [historyData, setHistoryData] = useState([]);
   const [isProcessing, setIsProcessing] = useState(false);
-  const [isDetailAnalyzing, setIsDetailAnalyzing] = useState(false);
   const [progress, setProgress] = useState(0);
   
   const [statusState, setStatusState] = useState({
@@ -342,15 +282,12 @@ export default function App() {
     alert("設定を保存しました");
   };
 
-  // 接続テスト (賢くフォールバックする)
   const testConnection = async () => {
     const keys = parseKeys(apiKeysText);
     if (keys.length === 0) return alert("APIキーが入力されていません");
     
     setKeyStatuses({});
     let results = {};
-    
-    // 現在選択中のモデル (カスタムがあればそちら優先)
     const targetModel = modelId === 'custom' ? customModelId : modelId;
 
     for (const key of keys) {
@@ -358,7 +295,6 @@ export default function App() {
       setKeyStatuses({...results});
       
       try {
-        // まず選択中のモデルでテスト
         const url = `https://generativelanguage.googleapis.com/v1beta/models/${targetModel}:generateContent?key=${key}`;
         let res = await fetch(url, {
           method: 'POST',
@@ -369,7 +305,6 @@ export default function App() {
         if (res.ok) {
           results[key] = { status: 'ok', msg: `接続OK (${targetModel})` };
         } else if (res.status === 404) {
-          // 404なら安定版で再トライ
           const fallbackUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${key}`;
           const resFallback = await fetch(fallbackUrl, {
             method: 'POST',
@@ -399,7 +334,7 @@ export default function App() {
         await addDoc(collection(db, 'ip_checks'), {
           productName: item.productName,
           risk: item.risk,
-          reason: item.detailedReason || item.reason, 
+          reason: item.reason,
           sourceFile: item.sourceFile,
           createdAt: serverTimestamp()
         });
@@ -456,10 +391,119 @@ export default function App() {
       deadKeysCount: 0 
     });
     setIsProcessing(false);
-    setIsDetailAnalyzing(false);
     stopRef.current = true;
     setHeaders([]);
     setTargetColIndex(-1);
+  };
+
+  const processBatch = async (items, startIndex, totalItems) => {
+    const currentModelId = modelId === 'custom' ? customModelId : modelId;
+    const BULK_SIZE = 30;
+    const CONCURRENCY = isHighSpeed ? 3 : 2;
+    
+    let currentIndex = 0;
+    
+    while (currentIndex < items.length) {
+      if (stopRef.current) break;
+      
+      const tasks = [];
+      const currentBatchNum = Math.floor((startIndex + currentIndex) / BULK_SIZE) + 1;
+      const totalBatches = Math.ceil(totalItems / BULK_SIZE);
+      
+      setStatusState(prev => ({
+        ...prev,
+        message: `処理中... (${startIndex + currentIndex}/${totalItems}件)`,
+        currentBatch: currentBatchNum,
+        totalBatches: totalBatches,
+        deadKeysCount: parseKeys(apiKeysText).length - activeKeys.length 
+      }));
+
+      for (let c = 0; c < CONCURRENCY; c++) {
+        const chunkStart = currentIndex + (c * BULK_SIZE);
+        if (chunkStart >= items.length) break;
+        const chunkEnd = Math.min(chunkStart + BULK_SIZE, items.length);
+        
+        const chunkProducts = [];
+        for (let i = chunkStart; i < chunkEnd; i++) {
+          const item = items[i];
+          chunkProducts.push({
+            id: item.id, // CSV行インデックス
+            name: item.name.length > 500 ? item.name.substring(0, 500) + "..." : item.name,
+            sourceFile: item.sourceFile
+          });
+        }
+        
+        if (chunkProducts.length > 0) {
+          tasks.push(
+            checkIPRiskBulkWithRotation(chunkProducts, activeKeys, setActiveKeys, currentModelId).then(resultMap => {
+              return chunkProducts.map(p => ({
+                id: p.id,
+                productName: p.name,
+                sourceFile: p.sourceFile,
+                risk: resultMap[p.id]?.risk || "Error",
+                reason: resultMap[p.id]?.reason || "判定失敗"
+              }));
+            })
+          );
+        }
+      }
+
+      if (tasks.length > 0) {
+        try {
+          const chunkResults = await Promise.all(tasks);
+          const flatResults = chunkResults.flat();
+          
+          // 結果を更新 (新規または上書き)
+          setResults(prev => {
+            const newResults = [...prev];
+            flatResults.forEach(newItem => {
+              const existingIdx = newResults.findIndex(r => r.id === newItem.id);
+              if (existingIdx !== -1) {
+                newResults[existingIdx] = newItem; // 上書き (再検査時)
+              } else {
+                newResults.push(newItem); // 新規追加
+              }
+            });
+            // ID順にソートしておくと見やすい
+            return newResults.sort((a, b) => a.id - b.id);
+          });
+
+          // 状態更新
+          // 注意: setResultsは非同期なので、ここでの集計は直近のflatResultsを使う
+          const batchSuccess = flatResults.filter(r => r.risk !== 'Error').length;
+          const batchErrors = flatResults.filter(r => r.risk === 'Error').length;
+          
+          setStatusState(prev => ({
+            ...prev,
+            successCount: prev.successCount + batchSuccess,
+            errorCount: prev.errorCount + batchErrors
+          }));
+
+          // 保存
+          flatResults.forEach(res => {
+             if (res.risk !== 'Error') saveToHistory(res);
+          });
+
+          currentIndex += tasks.reduce((acc, _, idx) => {
+             const processedInTask = Math.min(currentIndex + ((idx + 1) * BULK_SIZE), items.length) - (currentIndex + (idx * BULK_SIZE));
+             return acc + (processedInTask > 0 ? processedInTask : 0);
+          }, 0);
+          
+          // 進捗率は全体に対する割合
+          const currentTotalProcessed = results.length + flatResults.length; // 概算
+          // 正確な進捗は (startIndex + currentIndex) / totalItems
+          const nextProgress = Math.round(((startIndex + currentIndex) / totalItems) * 100);
+          setProgress(nextProgress);
+
+        } catch (e) {
+          console.error("Batch error:", e);
+          currentIndex += (CONCURRENCY * BULK_SIZE);
+        }
+      }
+
+      const baseWait = isHighSpeed ? 300 : 1500;
+      if (currentIndex < items.length) await new Promise(resolve => setTimeout(resolve, baseWait));
+    }
   };
 
   const startProcessing = async () => {
@@ -470,7 +514,6 @@ export default function App() {
     if (csvData.length === 0) return;
 
     setIsProcessing(true);
-    setIsDetailAnalyzing(false);
     stopRef.current = false;
     setResults([]); 
     setProgress(0);
@@ -484,175 +527,77 @@ export default function App() {
       deadKeysCount: 0
     });
 
-    const BULK_SIZE = 30; 
-    const CONCURRENCY = isHighSpeed ? 3 : 2;
+    const itemsToProcess = csvData.map((row, i) => ({
+      id: i,
+      name: row[targetColIndex] || "不明な商品名",
+      sourceFile: row[row.length - 1]
+    }));
 
-    let currentIndex = 0;
-    const total = csvData.length;
-    const totalBatches = Math.ceil(total / BULK_SIZE);
-
-    const initialJitter = Math.random() * 2000;
-    await new Promise(resolve => setTimeout(resolve, initialJitter));
-
-    // 実行時に使うモデルID
-    const currentModelId = modelId === 'custom' ? customModelId : modelId;
-
-    while (currentIndex < total) {
-      if (stopRef.current) break;
-      
-      const tasks = [];
-      const currentBatchNum = Math.floor(currentIndex / BULK_SIZE) + 1;
-      
-      setStatusState(prev => ({
-        ...prev,
-        message: `並列処理中... (${currentIndex}/${total}件)`,
-        currentBatch: currentBatchNum,
-        totalBatches: totalBatches,
-        deadKeysCount: parseKeys(apiKeysText).length - activeKeys.length 
-      }));
-
-      for (let c = 0; c < CONCURRENCY; c++) {
-        const chunkStart = currentIndex + (c * BULK_SIZE);
-        if (chunkStart >= total) break;
-        const chunkEnd = Math.min(chunkStart + BULK_SIZE, total);
-        
-        const chunkProducts = [];
-        for (let i = chunkStart; i < chunkEnd; i++) {
-          const row = csvData[i];
-          const productName = row[targetColIndex] || "不明な商品名";
-          chunkProducts.push({
-            id: i,
-            name: productName.length > 500 ? productName.substring(0, 500) + "..." : productName,
-            sourceFile: row[row.length - 1]
-          });
-        }
-        
-        if (chunkProducts.length > 0) {
-          tasks.push(
-            checkIPRiskBulkWithRotation(chunkProducts, activeKeys, setActiveKeys, currentModelId).then(resultMap => {
-              return chunkProducts.map(p => ({
-                id: p.id,
-                productName: p.name,
-                sourceFile: p.sourceFile,
-                risk: resultMap[p.id]?.risk || "Error",
-                reason: resultMap[p.id]?.reason || "判定失敗",
-                detailedReason: null
-              }));
-            })
-          );
-        }
-      }
-
-      if (tasks.length > 0) {
-        try {
-          const chunkResults = await Promise.all(tasks);
-          const flatResults = chunkResults.flat();
-          
-          const success = flatResults.filter(r => r.risk !== 'Error').length;
-          const errors = flatResults.filter(r => r.risk === 'Error').length;
-          
-          setResults(prev => [...prev, ...flatResults]);
-          setStatusState(prev => ({
-            ...prev,
-            successCount: prev.successCount + success,
-            errorCount: prev.errorCount + errors
-          }));
-
-          currentIndex += tasks.reduce((acc, _, idx) => {
-             const processedInTask = Math.min(currentIndex + ((idx + 1) * BULK_SIZE), total) - (currentIndex + (idx * BULK_SIZE));
-             return acc + (processedInTask > 0 ? processedInTask : 0);
-          }, 0);
-          
-          const nextProgress = Math.round((currentIndex / total) * 100);
-          setProgress(nextProgress);
-
-        } catch (e) {
-          if (e.message.includes("ALL_KEYS_DEAD")) {
-             alert("全てのAPIキーが無効になりました。設定画面で「接続テスト」を行い、有効なキーを確認してください。");
-             break;
-          }
-          console.error("Batch error:", e);
-          currentIndex += (CONCURRENCY * BULK_SIZE);
-        }
-      }
-
-      const baseWait = isHighSpeed ? 300 : 1500;
-      if (currentIndex < total) await new Promise(resolve => setTimeout(resolve, baseWait));
-    }
+    await processBatch(itemsToProcess, 0, itemsToProcess.length);
     
     setProgress(100);
-    setStatusState(prev => ({ ...prev, message: '一次審査完了' }));
+    setStatusState(prev => ({ ...prev, message: '検査完了' }));
     setIsProcessing(false);
   };
 
-  const startDetailAnalysis = async () => {
-    if (activeKeys.length === 0) return alert("有効なキーがありません");
-    setIsDetailAnalyzing(true);
+  // エラー分のみ再検査
+  const retryErrors = async () => {
+    const errorItems = results.filter(r => r.risk === 'Error');
+    if (errorItems.length === 0) return alert("エラーの商品はありません");
+
+    setIsProcessing(true);
     stopRef.current = false;
     
-    const riskyItems = results.filter(r => ['Critical', 'High', 'Medium'].includes(r.risk));
-    const totalRisky = riskyItems.length;
-    let newResults = [...results];
-    const CONCURRENCY = 5;
-    const currentModelId = modelId === 'custom' ? customModelId : modelId;
+    // エラーカウントをリセットせず、現在の状態からスタートしたいが、
+    // わかりやすくするためにエラーカウント分を減らす処理などは複雑になるため
+    // メッセージだけ更新する
+    setStatusState(prev => ({ ...prev, message: 'エラー分を再検査中...', errorCount: 0 })); // 表示上のエラー数はリセット
+
+    const itemsToRetry = errorItems.map(item => ({
+      id: item.id,
+      name: item.productName,
+      sourceFile: item.sourceFile
+    }));
+
+    // 再検査時は全件数 = 全csvData数 として進捗を出すのは難しいので
+    // 再検査対象の中での進捗を出す、あるいは100%に近いところからスタートするか
+    // ここではシンプルに「再検査対象」に対する進捗を表示する形にする
+    // ただし processBatch は全体の進捗計算ロジックを含んでいるため、
+    // 簡易的に実行する
     
-    setStatusState(prev => ({ ...prev, message: '詳細鑑定を開始します...', totalBatches: totalRisky, currentBatch: 0 }));
+    // progressの計算がややこしくなるため、再検査時はプログレスバーは目安程度に
+    await processBatch(itemsToRetry, 0, itemsToRetry.length);
 
-    for (let i = 0; i < totalRisky; i += CONCURRENCY) {
-      if (stopRef.current) break;
-      if (activeKeys.length === 0) break;
-      
-      const batch = riskyItems.slice(i, i + CONCURRENCY);
-      setStatusState(prev => ({ ...prev, message: `詳細鑑定中 (${i + 1}/${totalRisky})`, currentBatch: i + 1 }));
-
-      try {
-        const promises = batch.map(item => {
-          return checkIPRiskDetailWithRotation(item, activeKeys, setActiveKeys, currentModelId).then(res => ({
-            id: item.id,
-            finalRisk: res.risk,
-            detail: res.detail
-          }));
-        });
-
-        const batchResults = await Promise.all(promises);
-
-        batchResults.forEach(res => {
-          const index = newResults.findIndex(r => r.id === res.id);
-          if (index !== -1) {
-            newResults[index] = { ...newResults[index], risk: res.finalRisk, detailedReason: res.detail, isDetailed: true };
-            saveToHistory(newResults[index]);
-          }
-        });
-        setResults([...newResults]); 
-        
-      } catch (e) {
-      }
-      await new Promise(resolve => setTimeout(resolve, 500));
-    }
-    setIsDetailAnalyzing(false);
-    setStatusState(prev => ({ ...prev, message: '全工程完了' }));
+    setIsProcessing(false);
+    setStatusState(prev => ({ ...prev, message: '再検査完了' }));
   };
 
-  const downloadCSV = (dataToDownload, filterRisky = false) => {
+  const downloadCSV = (dataToDownload, mode = 'all') => {
     const bom = new Uint8Array([0xEF, 0xBB, 0xBF]);
-    let csvContent = "商品名,リスク判定,理由,詳細分析(AI弁護士),元ファイル名,判定日時\n";
-    const data = filterRisky ? dataToDownload.filter(r => r.risk !== 'Low' && r.risk !== 'Error') : dataToDownload;
+    let csvContent = "商品名,リスク判定,理由,元ファイル名,判定日時\n";
+    
+    let data = dataToDownload;
+    if (mode === 'risky') {
+        data = dataToDownload.filter(r => r.risk !== 'Low' && r.risk !== 'Error');
+    } else if (mode === 'error') {
+        data = dataToDownload.filter(r => r.risk === 'Error');
+    }
+
     if (data.length === 0) return alert("該当するデータがありません");
 
     data.forEach(r => {
       const riskLabel = RISK_MAP[r.risk]?.label || r.risk;
       const name = `"${(r.productName || '').replace(/"/g, '""')}"`;
       const reason = `"${(r.reason || '').replace(/"/g, '""')}"`;
-      const detail = `"${(r.detailedReason || '').replace(/"/g, '""')}"`;
       const file = `"${(r.sourceFile || '').replace(/"/g, '""')}"`;
       const date = r.createdAt ? new Date(r.createdAt.seconds * 1000).toLocaleString() : new Date().toLocaleString();
-      csvContent += `${name},${riskLabel},${reason},${detail},${file},${date}\n`;
+      csvContent += `${name},${riskLabel},${reason},${file},${date}\n`;
     });
     const blob = new Blob([bom, csvContent], { type: "text/csv;charset=utf-8;" });
     const url = URL.createObjectURL(blob);
     const link = document.createElement("a");
     link.href = url;
-    link.setAttribute("download", `ip_check_result.csv`);
+    link.setAttribute("download", `ip_check_${mode}.csv`);
     document.body.appendChild(link);
     link.click(); document.body.removeChild(link);
   };
@@ -683,6 +628,8 @@ export default function App() {
       </div>
     );
   }
+
+  const errorCount = results.filter(r => r.risk === 'Error').length;
 
   return (
     <div className="min-h-screen bg-slate-50 font-sans text-slate-800">
@@ -790,7 +737,7 @@ export default function App() {
                     </div>
                   </div>
                   
-                  {!isProcessing && !isDetailAnalyzing ? (
+                  {!isProcessing ? (
                     <div className="flex items-center gap-2">
                       {results.length > 0 ? (
                         <button onClick={handleReset} className="flex items-center gap-2 px-8 py-3 bg-slate-600 hover:bg-slate-700 text-white font-bold rounded-lg shadow-md transition-transform active:scale-95 whitespace-nowrap"><RotateCcw className="w-5 h-5" /> 次のファイルをチェック</button>
@@ -799,27 +746,26 @@ export default function App() {
                       )}
                     </div>
                   ) : (
-                    <button onClick={() => {stopRef.current = true; setIsProcessing(false); setIsDetailAnalyzing(false); setStatusState(p => ({...p, message: '停止しました'}));}} className="flex items-center gap-2 px-8 py-3 bg-amber-500 hover:bg-amber-600 text-white font-bold rounded-lg shadow-md transition-transform active:scale-95 whitespace-nowrap"><Pause className="w-5 h-5" /> 一時停止</button>
+                    <button onClick={() => {stopRef.current = true; setIsProcessing(false); setStatusState(p => ({...p, message: '停止しました'}));}} className="flex items-center gap-2 px-8 py-3 bg-amber-500 hover:bg-amber-600 text-white font-bold rounded-lg shadow-md transition-transform active:scale-95 whitespace-nowrap"><Pause className="w-5 h-5" /> 一時停止</button>
                   )}
                 </div>
               </div>
             </div>
 
-            {/* ダブルチェックアクション */}
-            {results.filter(r => ['Critical', 'High', 'Medium'].includes(r.risk)).length > 0 && !isProcessing && (
-              <div className="bg-indigo-50 border border-indigo-100 rounded-xl p-6 flex flex-col md:flex-row items-center justify-between gap-4 animate-in slide-in-from-top-2">
+            {/* エラーリカバリーエリア */}
+            {errorCount > 0 && !isProcessing && (
+              <div className="bg-rose-50 border border-rose-100 rounded-xl p-6 flex flex-col md:flex-row items-center justify-between gap-4 animate-in slide-in-from-top-2">
                 <div className="flex items-start gap-3">
-                  <div className="bg-indigo-100 p-2 rounded-lg text-indigo-600"><Scale className="w-6 h-6" /></div>
+                  <div className="bg-rose-100 p-2 rounded-lg text-rose-600"><AlertOctagon className="w-6 h-6" /></div>
                   <div>
-                    <h3 className="font-bold text-indigo-900">AI弁護士によるダブルチェック</h3>
-                    <p className="text-sm text-indigo-700 mt-1">リスクあり商品を専門家AIが再鑑定します。</p>
+                    <h3 className="font-bold text-rose-900">判定エラーが発生しました ({errorCount}件)</h3>
+                    <p className="text-sm text-rose-700 mt-1">APIの混雑等により判定できなかった商品があります。</p>
                   </div>
                 </div>
-                {!isDetailAnalyzing ? (
-                  <button onClick={startDetailAnalysis} className="flex items-center gap-2 px-6 py-3 bg-indigo-600 hover:bg-indigo-700 text-white font-bold rounded-lg shadow-lg shadow-indigo-200 transition-all active:scale-95 whitespace-nowrap"><SearchCheck className="w-5 h-5" /> 詳細鑑定を実行</button>
-                ) : (
-                   <div className="flex items-center gap-2 text-indigo-600 font-bold px-4"><Loader2 className="w-5 h-5 animate-spin" /> 鑑定中...</div>
-                )}
+                <div className="flex items-center gap-2">
+                  <button onClick={() => downloadCSV(results, 'error')} className="flex items-center gap-2 px-4 py-2 bg-white border border-rose-200 text-rose-700 hover:bg-rose-50 font-bold rounded-lg shadow-sm transition-colors whitespace-nowrap"><Download className="w-4 h-4" /> エラー分CSV保存</button>
+                  <button onClick={retryErrors} className="flex items-center gap-2 px-6 py-2 bg-rose-600 hover:bg-rose-700 text-white font-bold rounded-lg shadow-lg shadow-rose-200 transition-all active:scale-95 whitespace-nowrap"><RefreshCw className="w-4 h-4" /> エラー分を再検査</button>
+                </div>
               </div>
             )}
 
@@ -829,8 +775,8 @@ export default function App() {
                   <h2 className="font-bold text-slate-700 flex items-center gap-2"><CheckCircle className="w-5 h-5 text-green-600" /> 判定結果 ({results.length}件)</h2>
                 </div>
                 <div className="flex items-center gap-2">
-                  <button onClick={() => downloadCSV(results, true)} disabled={results.length === 0} className="px-4 py-2 bg-red-50 border border-red-200 hover:bg-red-100 text-red-700 rounded-lg text-sm font-medium flex items-center gap-2 shadow-sm disabled:opacity-50 transition-colors"><Download className="w-4 h-4" /> リスクありのみ保存</button>
-                  <button onClick={() => downloadCSV(results, false)} disabled={results.length === 0} className="px-4 py-2 bg-white border border-slate-300 hover:bg-slate-50 text-slate-700 rounded-lg text-sm font-medium flex items-center gap-2 shadow-sm disabled:opacity-50"><Download className="w-4 h-4" /> 全件保存</button>
+                  <button onClick={() => downloadCSV(results, 'risky')} disabled={results.length === 0} className="px-4 py-2 bg-red-50 border border-red-200 hover:bg-red-100 text-red-700 rounded-lg text-sm font-medium flex items-center gap-2 shadow-sm disabled:opacity-50 transition-colors"><Download className="w-4 h-4" /> リスクありのみ保存</button>
+                  <button onClick={() => downloadCSV(results, 'all')} disabled={results.length === 0} className="px-4 py-2 bg-white border border-slate-300 hover:bg-slate-50 text-slate-700 rounded-lg text-sm font-medium flex items-center gap-2 shadow-sm disabled:opacity-50"><Download className="w-4 h-4" /> 全件保存</button>
                 </div>
               </div>
               <div className="flex-1 overflow-auto">
@@ -840,12 +786,11 @@ export default function App() {
                   </thead>
                   <tbody className="divide-y divide-slate-100">
                     {results.map((item, idx) => (
-                      <tr key={idx} className={`hover:bg-slate-50 transition-colors ${item.risk === 'Critical' ? 'bg-rose-50' : ''}`}>
-                        <td className="px-4 py-3 text-center"><RiskBadge risk={item.risk} />{item.isDetailed && <div className="mt-1 text-[10px] text-indigo-600 font-bold border border-indigo-200 bg-indigo-50 rounded px-1">鑑定済</div>}</td>
+                      <tr key={idx} className={`hover:bg-slate-50 transition-colors ${item.risk === 'Critical' ? 'bg-rose-50' : item.risk === 'Error' ? 'bg-gray-100' : ''}`}>
+                        <td className="px-4 py-3 text-center"><RiskBadge risk={item.risk} /></td>
                         <td className="px-4 py-3"><div className="font-medium text-slate-700 line-clamp-2" title={item.productName}>{item.productName}</div></td>
                         <td className="px-4 py-3">
-                          <div className={`text-xs mb-1 ${item.risk === 'Critical' ? 'text-rose-700 font-bold' : item.risk === 'High' ? 'text-red-600 font-bold' : 'text-slate-600'}`}>{item.reason}</div>
-                          {item.detailedReason && <div className="text-xs text-indigo-700 bg-indigo-50 p-2 rounded border border-indigo-100 mt-1"><span className="font-bold mr-1">【弁護士AI】</span>{item.detailedReason}</div>}
+                          <div className={`text-xs mb-1 ${item.risk === 'Critical' ? 'text-rose-700 font-bold' : item.risk === 'High' ? 'text-red-600 font-bold' : item.risk === 'Error' ? 'text-gray-500' : 'text-slate-600'}`}>{item.reason}</div>
                         </td>
                         <td className="px-4 py-3 text-xs text-slate-400 truncate max-w-[150px]" title={item.sourceFile}>{item.sourceFile}</td>
                       </tr>
@@ -857,7 +802,48 @@ export default function App() {
           </div>
         )}
 
-        {/* --- 設定画面 --- */}
+        {/* ... (history, settings tabs remain same as before) ... */}
+        {activeTab === 'history' && (
+          <div className="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden animate-in fade-in">
+            <div className="p-6 border-b border-slate-100 flex justify-between items-center bg-slate-50">
+              <div>
+                <h2 className="text-lg font-bold text-slate-800 flex items-center gap-2"><History className="w-5 h-5 text-blue-600" /> チェック履歴 (最新50件)</h2>
+                <p className="text-xs text-slate-500 mt-1">「危険」「高」「中」の判定のみクラウドに保存されています。</p>
+              </div>
+              {!db && <span className="text-xs text-red-500 bg-red-50 px-2 py-1 rounded border border-red-100">※Firebase未設定</span>}
+            </div>
+            <div className="overflow-x-auto">
+              <table className="w-full text-sm text-left">
+                <thead className="text-xs text-slate-500 uppercase bg-slate-50">
+                  <tr>
+                    <th className="px-6 py-3">日時</th>
+                    <th className="px-6 py-3 text-center">判定</th>
+                    <th className="px-6 py-3">商品名</th>
+                    <th className="px-6 py-3">理由</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-100">
+                  {historyData.map((item) => (
+                    <tr key={item.id} className="hover:bg-slate-50">
+                      <td className="px-6 py-4 whitespace-nowrap text-slate-400 text-xs">
+                        {item.createdAt ? new Date(item.createdAt.seconds * 1000).toLocaleString() : '-'}
+                      </td>
+                      <td className="px-6 py-4 text-center"><RiskBadge risk={item.risk} /></td>
+                      <td className="px-6 py-4 font-medium text-slate-700 max-w-xs truncate">{item.productName}</td>
+                      <td className="px-6 py-4 text-slate-600 text-xs">{item.reason}</td>
+                    </tr>
+                  ))}
+                  {historyData.length === 0 && (
+                    <tr>
+                      <td colSpan="4" className="px-6 py-8 text-center text-slate-400">履歴がありません</td>
+                    </tr>
+                  )}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        )}
+
         {activeTab === 'settings' && (
           <div className="max-w-2xl mx-auto space-y-6 animate-in fade-in">
             <div className="bg-white p-6 rounded-xl shadow-sm border border-slate-200">
