@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { Upload, FileText, CheckCircle, Play, Download, Loader2, ShieldAlert, Pause, Trash2, Eye, Zap, FolderOpen, Lock, LogOut, Settings, Save, AlertTriangle, RefreshCw, Layers, Siren, Scale, SearchCheck, Activity, Cpu, Key, Ban, RotateCcw, Stethoscope, Check, X, Edit3, Flame, Rocket } from 'lucide-react';
+import { Upload, FileText, CheckCircle, Play, Download, Loader2, ShieldAlert, Pause, Trash2, Eye, Zap, FolderOpen, Lock, LogOut, History, Settings, Save, AlertTriangle, RefreshCw, Layers, Siren, Scale, SearchCheck, Activity, Cpu, Key, Ban, RotateCcw, Stethoscope, Check, X, Edit3, Flame, Rocket, FileDown } from 'lucide-react';
 import { initializeApp } from 'firebase/app';
-import { getFirestore } from 'firebase/firestore';
+import { getFirestore, collection, addDoc, query, orderBy, limit, onSnapshot, serverTimestamp } from 'firebase/firestore';
 
 // ==========================================
 // 定数・設定
@@ -249,6 +249,7 @@ export default function App() {
   const [firebaseConfigJson, setFirebaseConfigJson] = useState('');
   const [modelId, setModelId] = useState(DEFAULT_MODEL);
   const [customModelId, setCustomModelId] = useState(''); 
+  const [db, setDb] = useState(null);
   
   const [activeTab, setActiveTab] = useState('checker');
   const [files, setFiles] = useState([]);
@@ -289,11 +290,9 @@ export default function App() {
       setActiveKeys(parseKeys(legacyKey));
     }
 
-    // モデルは基本的にデフォルト(2.5)だが、カスタム保存があれば復元
     if (savedModel) setModelId(savedModel);
     if (savedCustomModel) setCustomModelId(savedCustomModel);
     
-    // Firebase設定は保存されているが、初期化はエラー防止のためのダミー的なもの
     if (savedFbConfig) {
       setFirebaseConfigJson(savedFbConfig);
       try {
@@ -407,6 +406,33 @@ export default function App() {
       } catch (err) { alert(`${file.name} の読み込みに失敗しました。エンコードを確認してください。`); }
     }
     setCsvData(prev => [...prev, ...newRows]);
+  };
+
+  // 結合CSVダウンロード機能
+  const downloadMergedCSV = () => {
+    if (csvData.length === 0) return alert("データがありません");
+    
+    const bom = new Uint8Array([0xEF, 0xBB, 0xBF]);
+    // ヘッダー行の作成
+    let csvContent = headers.map(h => `"${h.replace(/"/g, '""')}"`).join(',') + "\n";
+    
+    // データ行の作成
+    csvData.forEach(row => {
+      const rowString = row.map(field => {
+        const val = field === null || field === undefined ? '' : String(field);
+        return `"${val.replace(/"/g, '""')}"`;
+      }).join(',');
+      csvContent += rowString + "\n";
+    });
+
+    const blob = new Blob([bom, csvContent], { type: "text/csv;charset=utf-8;" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.setAttribute("download", `merged_data_${new Date().getTime()}.csv`);
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
   };
 
   const handleReset = () => {
@@ -713,9 +739,21 @@ export default function App() {
                     <p className="text-xs text-slate-500 mt-1">またはクリックしてファイルを選択</p>
                   </div>
                   {files.length > 0 && (
-                    <div className="mt-4 bg-slate-50 rounded-lg p-3 border border-slate-100 flex justify-between items-center">
-                      <span className="text-xs font-bold text-slate-600">読み込み済み: {files.length}ファイル ({csvData.length}件)</span>
-                      <button onClick={handleReset} className="text-xs text-red-500 hover:text-red-700 flex items-center gap-1"><Trash2 className="w-3 h-3" /> 全削除</button>
+                    <div className="mt-4 bg-slate-50 rounded-lg p-3 border border-slate-100">
+                      <div className="flex justify-between items-center mb-2">
+                        <span className="text-xs font-bold text-slate-600">読み込み済み: {files.length}ファイル ({csvData.length}件)</span>
+                        <div className="flex gap-2">
+                          <button onClick={downloadMergedCSV} className="text-xs text-indigo-600 hover:text-indigo-800 flex items-center gap-1 font-bold bg-indigo-50 px-2 py-1 rounded border border-indigo-100"><FileDown className="w-3 h-3" /> 結合CSV保存</button>
+                          <button onClick={handleReset} className="text-xs text-red-500 hover:text-red-700 flex items-center gap-1"><Trash2 className="w-3 h-3" /> 全削除</button>
+                        </div>
+                      </div>
+                      <div className="max-h-24 overflow-y-auto space-y-1">
+                        {files.map((f, i) => (
+                          <div key={i} className="text-xs text-slate-500 flex items-center gap-2">
+                            <FileText className="w-3 h-3" /> {f.name}
+                          </div>
+                        ))}
+                      </div>
                     </div>
                   )}
                 </div>
@@ -876,10 +914,7 @@ export default function App() {
                     </div>
                   )}
                 </div>
-                <div>
-                  <label className="block text-sm font-medium text-slate-700 mb-1">Firebase Config (JSON)</label>
-                  <textarea value={firebaseConfigJson} onChange={(e) => setFirebaseConfigJson(e.target.value)} className="w-full px-4 py-2 border rounded-lg bg-slate-50 h-32 text-xs font-mono" />
-                </div>
+                
                 <div className="pt-4">
                   <button onClick={saveSettings} className="flex items-center justify-center gap-2 w-full bg-indigo-600 text-white font-bold py-2 rounded-lg hover:bg-indigo-700 shadow-sm"><Save className="w-4 h-4" /> 設定を保存</button>
                 </div>
